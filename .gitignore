@@ -1,0 +1,56 @@
+.DS_Store
+Tamil_song_Ai/backend/Scripts/.env
+Tamil_song_Ai/backend/data/
+
+# =====================
+# Python
+# =====================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# =====================
+# Environment variables
+# =====================
+.env
+
+# =====================
+# Data / state
+# =====================
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# =====================
+# Qdrant local storage
+# =====================
+qdrant_data/
+data/qdrant/
+
+# =====================
+# Logs
+# =====================
+*.log
+logs/
+
+# =====================
+# OS / Editor
+# =====================
+.DS_Store
+.idea/
+.vscode/
+*.swp
+tamil-ai-music/rag-ingestion/tamil2lyrics_songs.jsonl
+*.jsonl
