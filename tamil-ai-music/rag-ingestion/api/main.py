@@ -47,7 +47,10 @@ def playlist_from_seed(
     song_id: str,
     k: int = Query(15, ge=5, le=50)
 ):
-    playlist = build_playlist_from_seed(song_id=song_id, k=k)
+    playlist = build_playlist_from_seed(
+    seed_song_id=song_id,
+    limit_songs=k
+)
 
     return {
         "seed_song_id": song_id,
@@ -60,16 +63,9 @@ def playlist_from_seed(
 # Playlist from text query
 # -------------------------
 @app.get("/playlist/query")
-def playlist_from_query(
-    q: str = Query(..., description="Seed query"),
-    mood: Optional[str] = Query(None),
-    k: int = Query(15, ge=5, le=50)
-):
-    playlist = build_playlist_from_query(query=q, mood=mood, k=k)
-
+def playlist_query(q: str, mood: str | None = None, k: int = 20):
     return {
         "query": q,
         "mood": mood,
-        "count": len(playlist),
-        "playlist": playlist
+        "items": build_playlist_from_query(q, k=k, mood=mood)
     }

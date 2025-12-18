@@ -147,7 +147,7 @@ def build_playlist_from_seed(
 
     # Dedup by song_id; exclude the seed itself
     best_by_song: Dict[str, Dict[str, Any]] = {}
-    for h in hits:
+    """for h in hits:
         p = h.payload or {}
         sid = p.get("song_id")
         if not sid or sid == seed_song_id:
@@ -162,7 +162,7 @@ def build_playlist_from_seed(
                 "year": p.get("year"),
                 "mood": p.get("mood"),
                 "decade": p.get("decade"),
-            }
+            }"""
 
     playlist = sorted(best_by_song.values(), key=lambda x: x["score"], reverse=True)[:limit_songs]
 
@@ -174,6 +174,60 @@ def build_playlist_from_seed(
         "items": playlist,
     }
 
+def build_playlist_from_query(
+    query: str,
+    k: int = 20,
+    mood: str | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build a playlist using a text query instead of a seed song.
+    Reuses the same embedding + Qdrant logic as CLI.
+    """
+
+    client = QdrantClient(url=QDRANT_URL)
+    model = SentenceTransformer(EMBED_MODEL)
+
+    query_vector = model.encode(
+        query,
+        normalize_embeddings=True
+    ).tolist()
+
+    search_filter = None
+    if mood:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        search_filter = Filter(
+            must=[FieldCondition(key="mood", match=MatchValue(value=mood))]
+        )
+
+    hits = client.search(
+        collection_name=COLLECTION,
+        query_vector=query_vector,
+        limit=k * 5,  # oversample → dedupe later
+        query_filter=search_filter,
+    )
+
+    seen_song_ids = set()
+    playlist = []
+
+    for h in hits:
+        song_id = h.payload.get("song_id")
+        if not song_id or song_id in seen_song_ids:
+            continue
+
+        seen_song_ids.add(song_id)
+
+        playlist.append({
+            "score": round(h.score, 4),
+            "song_id": song_id,
+            "title": h.payload.get("title"),
+            "movie": h.payload.get("movie"),
+            "mood": h.payload.get("mood"),
+        })
+
+        if len(playlist) >= k:
+            break
+
+    return playlist
 
 if __name__ == "__main__":
     import argparse
