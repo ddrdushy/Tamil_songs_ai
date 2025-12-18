@@ -7,7 +7,7 @@ class StateStore:
     def __init__(self, path: str = None):
         # Always anchor to project root (rag-ingestion/)
         project_root = Path(__file__).resolve().parents[1]
-        default_path = project_root / "data" / "state.db"
+        default_path = project_root / "data" / "state_v2.db"
 
         self.path = Path(path).expanduser().resolve() if path else default_path
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -54,3 +54,22 @@ logs/
 *.swp
 tamil-ai-music/rag-ingestion/tamil2lyrics_songs.jsonl
 *.jsonl
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local runtime data
+data/**
+!data/qdrant/.keep
+
+# Env
+.env
+
+# Archive
+archive/
+
+
+__pycache__/
+*.pyc

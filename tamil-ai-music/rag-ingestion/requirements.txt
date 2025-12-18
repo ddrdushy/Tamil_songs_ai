@@ -1,4 +1,4 @@
-qdrant-client==1.12.1
+qdrant-client>=1.7.0
 sentence-transformers==3.0.1
 torch
 numpy
@@ -7,3 +7,5 @@ tqdm
 python-dotenv
 orjson
 bs4
+fastapi 
+uvicorn
