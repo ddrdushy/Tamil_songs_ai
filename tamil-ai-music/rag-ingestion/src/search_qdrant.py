@@ -20,13 +20,21 @@ def _mood_filter(mood: Optional[str]) -> Optional[Filter]:
 def search_songs(
     query: str,
     mood: Optional[str] = None,
-    top_k_songs: int = 10,
-    oversample_chunks: int = 80,
+    k: Optional[int] = None,
+    limit: Optional[int] = None,
+    oversample_chunks: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Semantic search in Qdrant by query text.
     Returns UNIQUE songs (dedup by song_id) ranked by best chunk score.
     """
+    # Backwards compatible: allow either k or limit
+    top_k = limit if limit is not None else (k if k is not None else 10)
+
+    # Oversample chunks so we have enough candidates after dedupe
+    if oversample_chunks is None:
+        oversample_chunks = max(top_k * 20, 200)
+
     client = QdrantClient(url=QDRANT_URL)
     model = SentenceTransformer(EMBED_MODEL)
 
@@ -58,13 +66,12 @@ def search_songs(
                 "mood": p.get("mood"),
                 "decade": p.get("decade"),
                 "themes": p.get("themes"),
-                # Helpful for debugging / UI preview:
                 "best_chunk": (p.get("chunk_text") or "")[:240],
             }
 
     # Sort by score desc, return top K unique songs
     out = sorted(best_by_song.values(), key=lambda x: x["score"], reverse=True)
-    return out[:top_k_songs]
+    return out[:top_k]
 
 
 if __name__ == "__main__":

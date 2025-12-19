@@ -1,234 +1,254 @@
+# 🎵 Tamil Lyrics RAG & Playlist Engine
 
-# 🎧 Tamil AI Music – RAG Ingestion & Search Backend
+A production-ready **Tamil song lyrics intelligence system** built using **RAG (Retrieval-Augmented Generation)** concepts.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
-![Qdrant](https://img.shields.io/badge/VectorDB-Qdrant-brightgreen)
-![RAG](https://img.shields.io/badge/AI-RAG-orange)
-![Embeddings](https://img.shields.io/badge/Embeddings-SentenceTransformers-purple)
-![Status](https://img.shields.io/badge/Status-Production%20Ready-success)
-![License](https://img.shields.io/badge/License-MIT-lightgrey)
-
-
-This project builds an **AI-powered music intelligence backend** for Tamil songs using **lyrics-based RAG (Retrieval Augmented Generation)**.
-
-It crawls Tamil song lyrics, enriches them with AI-derived metadata (mood, themes, decade), embeds them into a **vector database (Qdrant)**, and keeps the system **incrementally updatable** for daily runs.
-
-This backend powers a **web-based music player** that can:
-- Search songs by lyrics or vibe
-- Build strict mood-based queues
-- Recommend the next songs intelligently
-- Play songs via YouTube embeds (lazy lookup)
+This project:
+- Crawls Tamil song lyrics
+- Enriches them using **embedding-based classification**
+- Stores semantic chunks in **Qdrant**
+- Enables **semantic search** and **playlist generation**
+- Exposes everything via a **simple FastAPI layer**
+- Includes **unit tests** for core logic
 
 ---
 
-## 🧠 High-Level Architecture
+## 🚀 What This Project Does
 
-```
+### Core Capabilities
+- 🔍 Semantic search over Tamil lyrics
+- ❤️ Mood-aware discovery (romantic, sad, happy, etc.)
+- 🎧 Playlist generation from:
+  - A **seed song**
+  - A **natural language query**
+- ⚡ Incremental ingestion (state-tracked)
+- 🧪 Unit-tested core logic
+- 🌐 REST API for frontend / integration
 
-Crawler → Enrichment (AI) → Canonical Dataset → Vector DB (Qdrant)
-↑
-State DB
+---
 
-```
+## 🧠 Architecture Overview
+
+```text
+Tamil2Lyrics (crawl)
+        ↓
+Lyrics text
+        ↓
+Chunking + Embeddings
+        ↓
+Qdrant Vector DB
+        ↓
+Search / Playlist Logic
+        ↓
+FastAPI
+````
 
 ---
 
 ## 📁 Project Structure
 
-```
-
+```text
 rag-ingestion/
-├── data/
-│   ├── tamil2lyrics_songs.jsonl                # Raw crawl output
-│   ├── tamil2lyrics_songs_enriched.jsonl       # Enriched (may contain history)
-│   ├── tamil2lyrics_songs_enriched_latest.jsonl# Canonical latest-only dataset
-│   └── state.db                                # Ingestion state (SQLite)
+├── api/                     # FastAPI layer
+│   ├── main.py
+│   └── __init__.py
 │
-├── src/
-│   ├── ingest_qdrant.py        # Main ingestion logic
-│   ├── load_dataset.py        # Dataset loader & hashing
-│   ├── create_collection.py   # Qdrant collection setup
-│   └── state_store.py         # SQLite state tracking
+├── src/                     # Core domain logic
+│   ├── ingest_qdrant.py
+│   ├── search_qdrant.py
+│   ├── playlist_builder.py
+│   ├── preprocess.py
+│   ├── load_dataset.py
+│   ├── state_store.py
+│   ├── create_collection.py
+│   └── config.py
 │
-├── scripts/
-│   ├── data_scraper.py            # Lyrics crawler
-│   ├── json_enhancer.py           # AI enrichment (embedding-based classifier)
-│   ├── dedupe_enriched_latest.py  # Deduplicate to canonical dataset
-│   ├── run_full_ingestion.py      # Batch runner until ingestion completes
-│   └── daily_run.py               # Crawl → enrich → ingest (delta)
+├── scripts/                 # CLI / pipelines
+│   ├── crawl_ingest_direct.py
+│   ├── crawl.py
+│   ├── enrich.py
+│   ├── run_full_ingestion.py
+│   └── debug_reingest_loop.py
 │
-├── docker-compose.yml             # Qdrant container
+├── tests/                   # Unit tests
+│   ├── test_search.py
+│   ├── test_playlist.py
+│   ├── test_health.py
+│   └── test_core_point_id.py
+│
+├── data/                    # Local data & state
+│   ├── raw/
+│   ├── enriched/
+│   ├── qdrant/
+│   └── state_v2.db
+│
+├── archive/                 # Old scripts & backups
+├── docs/                    # Screenshots / docs
+├── docker-compose.yml
 ├── requirements.txt
 └── README.md
-
-````
-
----
-
-## 🧾 Dataset Format (Canonical)
-
-Each song record contains:
-
-```json
-{
-  "song_id": "sha1(song_url)",
-  "song_title": "...",
-  "song_url": "...",
-  "movie_title": "...",
-  "movie_year": "2015",
-  "singer": "...",
-  "music_by": "...",
-  "english_lyrics": "...",
-  "tamil_lyrics": "...",
-  "primary_mood": "romantic",
-  "energy_level": "medium",
-  "theme_tags": "longing,yearning",
-  "is_family_friendly": true,
-  "decade": "2010s"
-}
-````
-
-> **song_id is deterministic**: `sha1(song_url)`
+```
 
 ---
 
-## 🚀 Setup Instructions
+## 🔁 Data Flow (Current Scope)
 
-### 1️⃣ Start Qdrant
+### 1️⃣ Crawl
+
+* Scrapes lyrics from **tamil2lyrics.com**
+* No YouTube, no external APIs
+* Resume-safe via URL tracking
 
 ```bash
-docker compose up -d
+python -m scripts.crawl_ingest_direct
 ```
-
-Qdrant UI: [http://localhost:6333](http://localhost:6333)
 
 ---
 
-### 2️⃣ Crawl Lyrics
+### 2️⃣ Enrich (Embedding-Based)
+
+* Uses **Sentence Transformers**
+* Derives:
+
+  * mood
+  * themes
+  * decade
+  * energy
+* No LLM calls required
+
+---
+
+### 3️⃣ Ingest into Qdrant
+
+* Lyrics are chunked
+* Each chunk embedded
+* Stored with metadata
+* State tracked via SQLite (`state_v2.db`)
+
+---
+
+## 🔍 Semantic Search
+
+### CLI
 
 ```bash
-python -m scripts.data_scraper
+python -m src.search_qdrant "love and longing" romantic
 ```
 
-Output:
+### API
 
-```
-data/tamil2lyrics_songs.jsonl
+```http
+GET /search?q=love and longing&mood=romantic&k=10
 ```
 
 ---
 
-### 3️⃣ Enrich with AI Metadata
+## 🎧 Playlist Builder
+
+### From Seed Song
 
 ```bash
-python -m scripts.json_enhancer
+python -m src.playlist_builder <song_id> 15
 ```
 
-Output:
-
-```
-data/tamil2lyrics_songs_enriched.jsonl
-```
-
----
-
-### 4️⃣ Create Canonical Latest-Only Dataset
+### From Query
 
 ```bash
-python -m scripts.dedupe_enriched_latest
+python -m src.playlist_builder --query "love and longing" --mood romantic --k 15
 ```
 
-Output:
+### API
 
+```http
+GET /playlist/seed/{song_id}?k=15
+GET /playlist/query?q=love+and+longing&mood=romantic&k=15
 ```
-data/tamil2lyrics_songs_enriched_latest.jsonl
-```
+
+Playlist logic:
+
+* Vector similarity
+* Mood-filtered
+* Deduplicated by song
+* Ranked by best chunk score
 
 ---
 
-### 5️⃣ Reset Ingestion State (first run only)
+## 🌐 API Layer
+
+### Run API
 
 ```bash
-rm data/state.db
+python -m uvicorn api.main:app --reload
 ```
+
+### Available Endpoints
+
+* `/health`
+* `/search`
+* `/playlist/seed/{song_id}`
+* `/playlist/query`
 
 ---
 
-### 6️⃣ Ingest into Qdrant (Full Run)
+## 🧪 Testing
+
+Run all tests:
 
 ```bash
-python -m scripts.run_full_ingestion
+pytest
 ```
 
-This:
+Covers:
 
-* Embeds lyrics in chunks
-* Upserts into Qdrant
-* Tracks progress via `state.db`
-* Stops automatically when complete
+* Search results
+* Playlist ranking
+* Deterministic point IDs
+* API health
 
 ---
 
-### 7️⃣ Verify
+## 🧩 Tech Stack
 
-```bash
-sqlite3 data/state.db "select count(*) from song_state;"
-```
-
-Expected:
-
-```
-19932
-```
+* **Python 3.10**
+* **SentenceTransformers**
+* **Qdrant**
+* **FastAPI**
+* **SQLite**
+* **Pytest**
 
 ---
 
-## 🔁 Daily Update Flow (Production)
+## ✅ Current Status
 
-Run once per day:
-
-```bash
-python -m scripts.daily_run
-```
-
-This will:
-
-1. Crawl new songs (append-only)
-2. Enrich only new/changed lyrics
-3. Deduplicate to latest-only
-4. Ingest only new/changed songs into Qdrant
+* ✔ Architecture stable
+* ✔ API functional
+* ✔ Playlist logic validated
+* ✔ Tested with partial crawl (1 page)
+* ⏳ Full crawl ingestion can be run later
 
 ---
 
-## 🎧 How This Powers the Music Player
+## 🧭 Next Logical Enhancements (Optional)
 
-The music player will:
-
-1. Embed user search query or selected song lyrics
-2. Query Qdrant with:
-
-   * Vector similarity
-   * Strict mood filter
-3. Build a smart queue
-4. Play via YouTube embed (URL resolved lazily)
+* Pagination in search
+* Diversity boosting in playlists
+* API response schemas (Pydantic)
+* Frontend / UI
+* CI pipeline
 
 ---
 
-## 🔐 Design Principles
+## ⚠️ Scope Note
 
-* Deterministic IDs (no Python `hash()`)
-* Append-only raw data
-* Canonical latest-only ingestion
-* Resumable & crash-safe
-* Scales beyond 100K songs
+This repository **only covers**:
+
+* Lyrics intelligence
+* Search & playlist generation
+
+**Radio mode, streaming, IVR, or audio playback are explicitly out of scope** and belong to a separate product.
 
 ---
 
-## 🧭 Next Steps
+## 🤝 License
 
-* Search API (lyrics / vibe)
-* Strict mood playlist builder
-* Web music player UI
-* YouTube lazy lookup & caching
-
-
+Internal / Experimental
+Use responsibly.

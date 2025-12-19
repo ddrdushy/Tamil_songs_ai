@@ -24,3 +24,13 @@ print("clean_len:", len(cln))
 print("chunks:", len(chs))
 print("hash:", h)
 print("first_chunk_preview:", chs[0][:120] if chs else "")
+
+import json
+
+def main():
+    sample_line = "..."  # whatever you use
+    row = json.loads(sample_line)
+    print(row)
+
+if __name__ == "__main__":
+    main()
