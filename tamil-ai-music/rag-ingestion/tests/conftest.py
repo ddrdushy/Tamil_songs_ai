@@ -3,12 +3,13 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
+os.environ.setdefault("DISABLE_WEB_RESOLVER", "1")
+
 @pytest.fixture(scope="session")
 def client():
-    # Ensure we use local qdrant
+    os.environ["ENABLE_WEB_RESOLUTION"] = "false"
     os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 
-    # Import AFTER env set
-    from api.main import app  # noqa
-
+    from api.main import app
+    from fastapi.testclient import TestClient
     return TestClient(app)

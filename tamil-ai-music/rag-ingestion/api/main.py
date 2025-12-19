@@ -1,15 +1,124 @@
 from fastapi import FastAPI, Query
 from typing import Optional, List, Dict, Any
 from fastapi import HTTPException
+from src.config import ENABLE_WEB_RESOLUTION
 
 from src.qdrant_updates import patch_song_payload
 from src.youtube_resolver import youtube_search_url
+
+from src.web_music_resolver import resolve_from_web
+from src.qdrant_utils import update_song_payload
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+from qdrant_client import QdrantClient
+from src.config import QDRANT_URL, COLLECTION
+
+from src.web_music_resolver import resolve_from_web
+
+import os
+DISABLE_WEB_RESOLVER = os.getenv("DISABLE_WEB_RESOLVER", "0") == "1"
+
+
 
 from src.search_qdrant import search_songs
 from src.playlist_builder import (
     build_playlist_from_seed,
     build_playlist_from_query
 )
+
+
+def _upsert_music_meta_to_qdrant(meta_map: dict[str, dict]) -> int:
+    if not meta_map:
+        return 0
+
+    client = QdrantClient(url=QDRANT_URL)
+    updated_songs = 0
+
+    for song_id, payload_updates in meta_map.items():
+        client.set_payload(
+            collection_name=COLLECTION,
+            payload=payload_updates,
+            points=Filter(
+                must=[
+                    FieldCondition(
+                        key="song_id",
+                        match=MatchValue(value=song_id)
+                    )
+                ]
+            ),
+        )
+        updated_songs += 1
+
+    return updated_songs
+
+def _resolve_and_upsert_music_meta(items: list[dict]) -> int:
+    """
+    For each playlist item, if genre/rhythm not present, try resolve_from_web(),
+    then upsert into Qdrant payload.
+    Returns number of songs updated.
+    """
+
+    # 0) Global toggle (both must allow)
+    if DISABLE_WEB_RESOLVER:
+        return 0
+    if not ENABLE_WEB_RESOLUTION:
+        return 0
+
+    # 1) Build candidates (only missing fields)
+    candidates: list[dict] = []
+    for it in items:
+        if not it.get("song_id") or not it.get("title"):
+            continue
+
+        # Skip if already present (treat either field missing as candidate)
+        has_genre = bool(it.get("genre"))
+        has_rhythm = bool(it.get("rhythm"))
+        if has_genre and has_rhythm:
+            continue
+
+        candidates.append(it)
+
+    if not candidates:
+        return 0
+
+    # 2) Resolve (web)
+    meta_map: dict[str, dict] = {}
+
+    for it in candidates:
+        meta = resolve_from_web(it)
+        if not meta:
+            continue
+
+        # Only include keys that are NOT None (so we never overwrite with None)
+        payload_updates: dict[str, object] = {}
+
+        genre = meta.get("genre")
+        rhythm = meta.get("rhythm")
+        mood_web = meta.get("mood")
+        source = meta.get("source")
+        confidence = meta.get("confidence")
+
+        if genre is not None:
+            payload_updates["genre"] = genre
+        if rhythm is not None:
+            payload_updates["rhythm"] = rhythm
+
+        # Optional fields (only write if present)
+        if mood_web is not None:
+            payload_updates["mood_web"] = mood_web
+        if source is not None:
+            payload_updates["meta_source"] = source
+        if confidence is not None:
+            payload_updates["meta_confidence"] = confidence
+
+        if payload_updates:
+            meta_map[it["song_id"]] = payload_updates
+
+    if not meta_map:
+        return 0
+
+    # 3) Upsert to Qdrant
+    return _upsert_music_meta_to_qdrant(meta_map)
 
 app = FastAPI(
     title="Tamil AI Music Engine",
@@ -105,10 +214,9 @@ def search(
 # -------------------------
 # Playlist from seed song
 # -------------------------
-@app.get("/playlist/seed/{song_id}")
-def playlist_from_seed(song_id: str, k: int = Query(20, ge=1, le=50)):
-    data = build_playlist_from_seed(seed_song_id=song_id, limit_songs=k)
-
+@app.get("/playlist/seed/{seed_song_id}")
+def playlist_from_seed(seed_song_id: str, k: int = Query(20, ge=1, le=50)):
+    data = build_playlist_from_seed(seed_song_id=seed_song_id, limit_songs=k)
 
     if not data.get("ok"):
         # tests accept 400/404/422; 404 is best
@@ -118,7 +226,8 @@ def playlist_from_seed(song_id: str, k: int = Query(20, ge=1, le=50)):
     url_map = _extract_url_map(data.get("items", []))
     updated = _upsert_youtube_urls_to_qdrant(url_map)
     data["youtube_urls_saved"] = updated
-    
+    meta_updated = _resolve_and_upsert_music_meta(data.get("items", []))
+    data["music_meta_saved"] = meta_updated
     return data
 
 
@@ -149,23 +258,23 @@ def playlist_query(
     url_map = _extract_url_map(data["items"])
     updated = _upsert_youtube_urls_to_qdrant(url_map)
     data["youtube_urls_saved"] = updated
-
+    meta_updated = _resolve_and_upsert_music_meta(data.get("items", []))
+    data["music_meta_saved"] = meta_updated
+    
     return data
 
 @app.get("/player/query")
 def player_query(
-    q: str = Query(..., description="Search query"),
-    mood: Optional[str] = Query(None, description="Mood filter"),
-    k: int = Query(20, ge=1, le=50),
+    q: str = Query(...),
+    mood: Optional[str] = Query(None),
+    k: int = Query(20),
 ):
-    # reuse existing function
     return playlist_query(q=q, mood=mood, k=k)
 
 
 @app.get("/player/seed/{seed_song_id}")
 def player_seed(
     seed_song_id: str,
-    k: int = Query(20, ge=1, le=50),
+    k: int = Query(20),
 ):
-    # reuse existing function
     return playlist_from_seed(seed_song_id=seed_song_id, k=k)
