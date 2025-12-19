@@ -9,3 +9,5 @@ orjson
 bs4
 fastapi 
 uvicorn
+pytest 
+httpx
