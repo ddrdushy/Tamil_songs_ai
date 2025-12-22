@@ -35,13 +35,12 @@ export default function Home() {
 
   // 2) Add this helper + effect inside Home()
 
+const enrichTimer = useRef<NodeJS.Timeout | null>(null);
 const enrichInFlight = useRef(false);
 
 useEffect(() => {
-  // no items => nothing to do
   if (!items.length) return;
 
-  // only resolve missing youtube urls
   const missing = items
     .filter((it) => it.song_id && !it.youtube_url)
     .map((it) => it.song_id);
@@ -53,21 +52,16 @@ useEffect(() => {
 
   (async () => {
     try {
-      // expected return shape: { items: [{ song_id, youtube_url }] } OR just map
-      const resolved = await fetchItemsBySongIds(missing);
+      const res = await requestYoutubeEnrichment(missing);
 
-      // normalize to a map { song_id: youtube_url }
-      const map: Record<string, string> = Array.isArray(resolved?.items)
-        ? Object.fromEntries(
-            resolved.items
-              .filter((x: any) => x?.song_id && x?.youtube_url)
-              .map((x: any) => [x.song_id, x.youtube_url])
-          )
-        : resolved?.map ?? resolved ?? {};
+      // res.items includes youtube_url for resolved ones
+      const map: Record<string, string> = {};
+      for (const x of res?.items ?? []) {
+        if (x?.song_id && x?.youtube_url) map[x.song_id] = x.youtube_url;
+      }
 
-      if (!map || !Object.keys(map).length) return;
+      if (!Object.keys(map).length) return;
 
-      // merge back into UI list
       setItems((prev) =>
         prev.map((it) => ({
           ...it,
@@ -75,13 +69,12 @@ useEffect(() => {
         }))
       );
     } catch (e) {
-      // ignore failures; UI still works without youtube_url
       console.warn("Background youtube_url resolve failed:", e);
     } finally {
       enrichInFlight.current = false;
     }
-    })();
-  }, [items]);
+  })();
+}, [items]);
 
 
   async function onSeedFromActive() {

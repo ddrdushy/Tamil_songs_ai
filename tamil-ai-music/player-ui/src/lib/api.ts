@@ -37,3 +37,14 @@ export async function fetchItemsBySongIds(song_ids: string[]) {
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+
+
+export async function requestYoutubeEnrichment(songIds: string[]) {
+  const r = await fetch("/api/player/enrich-youtube-urls", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ song_ids: songIds }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json(); // { ok, updated, items }
+}

@@ -8,8 +8,10 @@ from src.qdrant_read import fetch_items_by_song_ids
 from src.web_music_resolver import resolve_from_web
 from src.qdrant_utils import update_song_payload
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from qdrant_client.http import models as rest
 
-from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi import FastAPI, Query, HTTPException, Body,BackgroundTasks
+
 
 
 from qdrant_client import QdrantClient
@@ -34,24 +36,28 @@ def _upsert_music_meta_to_qdrant(meta_map: dict[str, dict]) -> int:
         return 0
 
     client = QdrantClient(url=QDRANT_URL)
-    updated_songs = 0
+    updated = 0
 
     for song_id, payload_updates in meta_map.items():
+        selector = rest.FilterSelector(
+            filter=rest.Filter(
+                must=[
+                    rest.FieldCondition(
+                        key="song_id",
+                        match=rest.MatchValue(value=song_id),
+                    )
+                ]
+            )
+        )
+
         client.set_payload(
             collection_name=COLLECTION,
             payload=payload_updates,
-            points=Filter(
-                must=[
-                    FieldCondition(
-                        key="song_id",
-                        match=MatchValue(value=song_id)
-                    )
-                ]
-            ),
+            points=selector,   # ✅ same fix
         )
-        updated_songs += 1
+        updated += 1
 
-    return updated_songs
+    return updated
 
 def _resolve_and_upsert_music_meta(items: list[dict]) -> int:
     if not ENABLE_WEB_RESOLUTION:
@@ -118,30 +124,33 @@ def _extract_url_map(items: list[dict]) -> dict[str, str]:
 
 
 def _upsert_youtube_urls_to_qdrant(url_map: dict[str, str]) -> int:
-    """
-    Writes youtube_url into Qdrant payload for those song_id points.
-    Returns number of song_ids updated.
-    """
     if not url_map:
         return 0
 
     client = QdrantClient(url=QDRANT_URL)
-
-    # IMPORTANT:
-    # This assumes your points have payload field "song_id"
-    # and you want to update payload field "youtube_url".
-    #
-    # We update by filter (song_id == X) so we don't need point IDs.
     updated = 0
-    for song_id, url in url_map.items():
+
+    for song_id, youtube_url in url_map.items():
+        if not song_id or not youtube_url:
+            continue
+
+        selector = rest.FilterSelector(
+            filter=rest.Filter(
+                must=[
+                    rest.FieldCondition(
+                        key="song_id",
+                        match=rest.MatchValue(value=song_id),
+                    )
+                ]
+            )
+        )
+
         client.set_payload(
             collection_name=COLLECTION,
-            payload={"youtube_url": url},
-            points=None,
-            filter={
-                "must": [{"key": "song_id", "match": {"value": song_id}}],
-            },
+            payload={"youtube_url": youtube_url},
+            points=selector,   # ✅ THIS is the key fix
         )
+
         updated += 1
 
     return updated
@@ -287,3 +296,51 @@ def items_by_song_ids(payload: dict = Body(...)):
     items = fetch_items_by_song_ids(song_ids)
 
     return {"ok": True, "count": len(items), "items": items}
+
+
+@app.post("/player/enrich-youtube-urls")
+def enrich_youtube_urls(payload: dict = Body(...)):
+    """
+    Body: { "song_ids": ["id1", "id2", ...] }
+
+    Resolves missing youtube_url for provided songs and saves into Qdrant.
+    Returns updated items so UI can merge immediately.
+    """
+    song_ids = payload.get("song_ids") or []
+    if not isinstance(song_ids, list) or not song_ids:
+        raise HTTPException(status_code=422, detail="song_ids must be a non-empty list")
+
+    # 1) fetch minimal payloads from Qdrant
+    items = fetch_items_by_song_ids(song_ids)
+
+    # 2) build url_map ONLY for missing youtube_url
+    # expected: { song_id: "https://www.youtube.com/watch?v=..." }
+    url_map = {}
+    for it in items:
+        sid = it.get("song_id")
+        if not sid:
+            continue
+        if it.get("youtube_url"):
+            continue  # already present
+        title = (it.get("title") or "").strip()
+        movie = (it.get("movie") or "").strip()
+
+        # your resolver should accept a string query
+        if title:
+            q = f"{title} {movie}".strip()
+            url = youtube_search_url(q)   # from src.youtube_resolver
+            if url:
+                url_map[sid] = url
+
+    # 3) upsert into qdrant
+    updated = _upsert_youtube_urls_to_qdrant(url_map)
+
+    # 4) return updated items to UI
+    updated_items = []
+    for it in items:
+        sid = it.get("song_id")
+        if sid in url_map and not it.get("youtube_url"):
+            it = {**it, "youtube_url": url_map[sid]}
+        updated_items.append(it)
+
+    return {"ok": True, "updated": updated, "items": updated_items}
