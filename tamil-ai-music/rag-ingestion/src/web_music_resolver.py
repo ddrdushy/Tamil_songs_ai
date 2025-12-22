@@ -85,46 +85,24 @@ def _resolve_from_wikidata(title: str) -> Optional[Dict]:
         "confidence": 0.65,
     }
 
-def _resolve_from_musicbrainz(title: str, artist: str | None = None) -> Optional[Dict]:
-    if not title:
+def _resolve_from_musicbrainz(title: str, artist: str | None = None):
+    try:
+        r = requests.get(
+            "https://musicbrainz.org/ws/2/recording/",
+            params={
+                "query": f'recording:"{title}"' + (f' AND artist:"{artist}"' if artist else ""),
+                "fmt": "json",
+                "limit": 1,
+            },
+            headers={"User-Agent": "TamilMusicAI/1.0 (+https://example.com)"},
+            timeout=6,   # ✅ IMPORTANT
+        )
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException:
         return None
-
-    # MusicBrainz recording search via query params
-    # Note: MB prefers a proper UA; keep it stable.
-    params = {
-        "query": f'recording:"{title}"',
-        "fmt": "json",
-        "limit": 1,
-    }
-    if artist:
-        params["query"] += f' AND artist:"{artist}"'
-
-    r = requests.get(
-        MB_SEARCH,
-        params=params,
-        headers={"User-Agent": "TamilMusicAI/1.0 (+https://example.com)"}
-    )
-    if r.status_code != 200:
-        return None
-
-    data = r.json()
-    recs = data.get("recordings", [])
-    if not recs:
-        return None
-
-    rec = recs[0]
-    tags = [t["name"].lower() for t in rec.get("tags", []) if "name" in t]
-    if not tags:
-        return None
-
-    return {
-        "genre": tags[0],
-        "rhythm": _infer_rhythm(tags),
-        "mood": _infer_mood(tags),
-        "source": "musicbrainz",
-        "confidence": 0.55,
-    }
-
+    
+    
 def _resolve_from_lyrics_text(song: Dict) -> Optional[Dict]:
     text = " ".join([
         song.get("title", "") or "",

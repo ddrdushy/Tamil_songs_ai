@@ -52,73 +52,48 @@ def _upsert_music_meta_to_qdrant(meta_map: dict[str, dict]) -> int:
     return updated_songs
 
 def _resolve_and_upsert_music_meta(items: list[dict]) -> int:
-    """
-    For each playlist item, if genre/rhythm not present, try resolve_from_web(),
-    then upsert into Qdrant payload.
-    Returns number of songs updated.
-    """
-
-    # 0) Global toggle (both must allow)
-    if DISABLE_WEB_RESOLVER:
-        return 0
     if not ENABLE_WEB_RESOLUTION:
         return 0
 
-    # 1) Build candidates (only missing fields)
-    candidates: list[dict] = []
+    candidates = []
     for it in items:
+        if it.get("genre") and it.get("rhythm"):
+            continue
         if not it.get("song_id") or not it.get("title"):
             continue
-
-        # Skip if already present (treat either field missing as candidate)
-        has_genre = bool(it.get("genre"))
-        has_rhythm = bool(it.get("rhythm"))
-        if has_genre and has_rhythm:
-            continue
-
         candidates.append(it)
+
+    # ✅ cap to avoid 20 web calls per request
+    candidates = candidates[:3]
 
     if not candidates:
         return 0
 
-    # 2) Resolve (web)
-    meta_map: dict[str, dict] = {}
-
+    meta_map = {}
     for it in candidates:
-        meta = resolve_from_web(it)
+        try:
+            meta = resolve_from_web(it)
+        except Exception:
+            meta = None
+
         if not meta:
             continue
 
-        # Only include keys that are NOT None (so we never overwrite with None)
-        payload_updates: dict[str, object] = {}
-
-        genre = meta.get("genre")
-        rhythm = meta.get("rhythm")
-        mood_web = meta.get("mood")
-        source = meta.get("source")
-        confidence = meta.get("confidence")
-
-        if genre is not None:
-            payload_updates["genre"] = genre
-        if rhythm is not None:
-            payload_updates["rhythm"] = rhythm
-
-        # Optional fields (only write if present)
-        if mood_web is not None:
-            payload_updates["mood_web"] = mood_web
-        if source is not None:
-            payload_updates["meta_source"] = source
-        if confidence is not None:
-            payload_updates["meta_confidence"] = confidence
-
-        if payload_updates:
-            meta_map[it["song_id"]] = payload_updates
+        meta_map[it["song_id"]] = {
+            "genre": meta.get("genre"),
+            "rhythm": meta.get("rhythm"),
+            "mood_web": meta.get("mood"),
+            "meta_source": meta.get("source"),
+            "meta_confidence": meta.get("confidence"),
+        }
 
     if not meta_map:
         return 0
 
-    # 3) Upsert to Qdrant
-    return _upsert_music_meta_to_qdrant(meta_map)
+    try:
+        return _upsert_music_meta_to_qdrant(meta_map)
+    except Exception:
+        return 0
 
 app = FastAPI(
     title="Tamil AI Music Engine",
@@ -278,3 +253,23 @@ def player_seed(
     k: int = Query(20),
 ):
     return playlist_from_seed(seed_song_id=seed_song_id, k=k)
+
+@app.post("/enrich/youtube")
+def enrich_youtube_urls(song_ids: List[str] = Body(..., embed=True)):
+    """
+    UI calls this after it shows playlist.
+    For each song_id, if youtube_url missing, resolve + upsert to Qdrant.
+    """
+    if not song_ids:
+        return {"ok": True, "requested": 0, "updated": 0}
+
+    # 1) fetch existing payload for these songs (optional but recommended)
+    # If you already have title/movie in UI items, you can skip fetching.
+    # We'll assume you can resolve using song_id -> payload in Qdrant
+    items = fetch_items_by_song_ids(song_ids)  # <-- implement or reuse existing helper
+
+    # 2) Build url_map only for missing youtube_url
+    url_map = _extract_url_map(items)  # should only produce missing ones
+    updated = _upsert_youtube_urls_to_qdrant(url_map)
+
+    return {"ok": True, "requested": len(song_ids), "updated": updated}
