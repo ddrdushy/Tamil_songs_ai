@@ -1,9 +1,13 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
 import type { SongItem } from "@/lib/types";
-import { fetchPlaylistByQuery, fetchPlaylistBySeed } from "@/lib/api";
 import YouTubePlayer from "@/components/YouTubePlayer";
+
+import React, { useMemo, useState, useEffect, useRef } from "react";
+import { fetchPlaylistByQuery, fetchPlaylistBySeed, fetchItemsBySongIds , requestYoutubeEnrichment} from "@/lib/api"; 
+
+
+
 
 const MOODS = ["romantic", "devotional", "kuthu", "happy", "melancholic", "sad", "angry", "inspirational"];
 
@@ -28,6 +32,57 @@ export default function Home() {
       setLoading(false);
     }
   }
+
+  // 2) Add this helper + effect inside Home()
+
+const enrichInFlight = useRef(false);
+
+useEffect(() => {
+  // no items => nothing to do
+  if (!items.length) return;
+
+  // only resolve missing youtube urls
+  const missing = items
+    .filter((it) => it.song_id && !it.youtube_url)
+    .map((it) => it.song_id);
+
+  if (!missing.length) return;
+  if (enrichInFlight.current) return;
+
+  enrichInFlight.current = true;
+
+  (async () => {
+    try {
+      // expected return shape: { items: [{ song_id, youtube_url }] } OR just map
+      const resolved = await fetchItemsBySongIds(missing);
+
+      // normalize to a map { song_id: youtube_url }
+      const map: Record<string, string> = Array.isArray(resolved?.items)
+        ? Object.fromEntries(
+            resolved.items
+              .filter((x: any) => x?.song_id && x?.youtube_url)
+              .map((x: any) => [x.song_id, x.youtube_url])
+          )
+        : resolved?.map ?? resolved ?? {};
+
+      if (!map || !Object.keys(map).length) return;
+
+      // merge back into UI list
+      setItems((prev) =>
+        prev.map((it) => ({
+          ...it,
+          youtube_url: it.youtube_url ?? map[it.song_id] ?? it.youtube_url,
+        }))
+      );
+    } catch (e) {
+      // ignore failures; UI still works without youtube_url
+      console.warn("Background youtube_url resolve failed:", e);
+    } finally {
+      enrichInFlight.current = false;
+    }
+    })();
+  }, [items]);
+
 
   async function onSeedFromActive() {
     if (!active?.song_id) return;

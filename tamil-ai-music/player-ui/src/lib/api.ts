@@ -27,3 +27,13 @@ export async function fetchPlaylistBySeed(args: {
   const data = await r.json();
   return data;
 }
+
+export async function fetchItemsBySongIds(song_ids: string[]) {
+  const r = await fetch(`/api/player/items-by-song-ids`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ song_ids }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}

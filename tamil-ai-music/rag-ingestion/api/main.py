@@ -1,14 +1,16 @@
-from fastapi import FastAPI, Query
+
 from typing import Optional, List, Dict, Any
-from fastapi import HTTPException
 from src.config import ENABLE_WEB_RESOLUTION
 
 from src.qdrant_updates import patch_song_payload
 from src.youtube_resolver import youtube_search_url
-
+from src.qdrant_read import fetch_items_by_song_ids
 from src.web_music_resolver import resolve_from_web
 from src.qdrant_utils import update_song_payload
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+from fastapi import FastAPI, Query, HTTPException, Body
+
 
 from qdrant_client import QdrantClient
 from src.config import QDRANT_URL, COLLECTION
@@ -273,3 +275,15 @@ def enrich_youtube_urls(song_ids: List[str] = Body(..., embed=True)):
     updated = _upsert_youtube_urls_to_qdrant(url_map)
 
     return {"ok": True, "requested": len(song_ids), "updated": updated}
+
+
+@app.post("/player/items-by-song-ids")
+def items_by_song_ids(payload: dict = Body(...)):
+    song_ids = payload.get("song_ids", [])
+    if not isinstance(song_ids, list) or not song_ids:
+        return {"ok": True, "items": []}
+
+    # TODO: implement this function in your existing qdrant/search module
+    items = fetch_items_by_song_ids(song_ids)
+
+    return {"ok": True, "count": len(items), "items": items}
