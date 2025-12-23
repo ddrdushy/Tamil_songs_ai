@@ -7,10 +7,11 @@ from src.youtube_resolver import youtube_search_url
 from src.qdrant_read import fetch_items_by_song_ids
 from src.web_music_resolver import resolve_from_web
 from src.qdrant_utils import update_song_payload
-from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue, FilterSelector
 from qdrant_client.http import models as rest
-
+from datetime import datetime
 from fastapi import FastAPI, Query, HTTPException, Body,BackgroundTasks
+from urllib.parse import urlparse
 
 
 
@@ -122,6 +123,18 @@ def _extract_url_map(items: list[dict]) -> dict[str, str]:
             out[sid] = url
     return out
 
+def _is_good_youtube_url(url: str | None) -> bool:
+    if not url:
+        return False
+    u = url.strip()
+
+    # BAD: search results placeholder
+    if "youtube.com/results" in u and "search_query=" in u:
+        return False
+
+    # GOOD: watch or youtu.be
+    return ("youtube.com/watch" in u) or ("youtu.be/" in u)
+
 
 def _upsert_youtube_urls_to_qdrant(url_map: dict[str, str]) -> int:
     if not url_map:
@@ -133,22 +146,32 @@ def _upsert_youtube_urls_to_qdrant(url_map: dict[str, str]) -> int:
     for song_id, youtube_url in url_map.items():
         if not song_id or not youtube_url:
             continue
+        is_good = _is_good_youtube_url(youtube_url)
 
-        selector = rest.FilterSelector(
-            filter=rest.Filter(
-                must=[
-                    rest.FieldCondition(
-                        key="song_id",
-                        match=rest.MatchValue(value=song_id),
-                    )
-                ]
-            )
+        # ✅ THIS is the payload_updates you asked about
+        payload_updates = {
+            "youtube_url": youtube_url,
+            "youtube_url_status": "resolved" if is_good else "placeholder",
+            "youtube_url_source": "youtube_resolver" if is_good else "search_placeholder",
+            "youtube_url_needs_refresh": not is_good,
+            "youtube_url_resolved_at": datetime.utcnow().isoformat() + "Z",
+            "youtube_url_resolver_version": "v2",
+        }
+        selector = FilterSelector(
+        filter=Filter(
+            must=[
+                FieldCondition(
+                    key="song_id",
+                    match=MatchValue(value=song_id),
+                )
+            ]
         )
+    )
 
         client.set_payload(
             collection_name=COLLECTION,
-            payload={"youtube_url": youtube_url},
-            points=selector,   # ✅ THIS is the key fix
+            payload=payload_updates,
+            points=selector,   # ✅ correct for your qdrant-client version
         )
 
         updated += 1
