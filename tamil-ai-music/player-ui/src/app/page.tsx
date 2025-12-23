@@ -1,7 +1,8 @@
 "use client";
 
 import type { SongItem } from "@/lib/types";
-import YouTubePlayer from "@/components/YouTubePlayer";
+import YouTubePlayer  from "@/components/YouTubePlayer";
+
 
 import React, { useMemo, useState, useEffect, useRef } from "react";
 import { fetchPlaylistByQuery, fetchPlaylistBySeed, fetchItemsBySongIds , requestYoutubeEnrichment} from "@/lib/api"; 
@@ -20,6 +21,7 @@ export default function Home() {
   const [items, setItems] = useState<SongItem[]>([]);
   const [activeIndex, setActiveIndex] = useState<number>(0);
   const active = useMemo(() => items[activeIndex], [items, activeIndex]);
+  const [autoAdvance, setAutoAdvance] = useState(true);
 
   async function onSearch() {
     setLoading(true);
@@ -103,7 +105,7 @@ useEffect(() => {
       <p className="mt-1 text-sm text-gray-600">
         Search → playlist → play (YouTube URLs come from your API).
       </p>
-
+    
       {/* Controls */}
       <div className="mt-6 grid gap-3 rounded-2xl border p-4 md:grid-cols-12">
         <div className="md:col-span-7">
@@ -198,7 +200,14 @@ useEffect(() => {
               </div>
             </div>
 
-            <YouTubePlayer youtubeUrl={active?.youtube_url} />
+            <YouTubePlayer
+            youtubeUrl={active?.youtube_url}
+            onEnded={() => {
+              if (!autoAdvance) return;
+              // loop back to start if last song
+              setActiveIndex((i) => (i + 1 < items.length ? i + 1 : 0));
+            }}
+          />
 
             <div className="mt-3 text-xs text-gray-600">
               If you don’t see video yet, it means `youtube_url` isn’t saved for
@@ -210,7 +219,16 @@ useEffect(() => {
         <section className="md:col-span-5">
           <div className="rounded-2xl border">
             <div className="border-b p-3 text-sm font-medium">
-              Playlist ({items.length})
+
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  Playlist ({items.length})
+                  <input
+                    type="checkbox"
+                    checked={autoAdvance}
+                    onChange={(e) => setAutoAdvance(e.target.checked)}
+                  />
+                  Auto-advance
+                </label>
             </div>
             <div className="max-h-[520px] overflow-auto">
               {items.map((it, idx) => {
