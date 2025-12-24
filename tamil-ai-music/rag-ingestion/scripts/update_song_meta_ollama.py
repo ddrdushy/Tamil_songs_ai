@@ -1,485 +1,426 @@
 #!/usr/bin/env python3
 """
-One-time updater: infer mood/genre/rhythm via local Ollama (smollm2:135m)
-and upsert into Qdrant for ALL chunks of each song_id.
+Update mood/genre/rhythm for songs stored in Qdrant using a LOCAL Ollama model.
 
-Usage examples:
-  python scripts/update_song_meta_ollama.py \
-    --qdrant-url http://localhost:6333 \
-    --collection tamil_songs \
-    --model smollm2:135m \
-    --limit 2000 \
-    --force
-
-  # safer: write only to *_llm fields (default), do not overwrite mood/genre/rhythm unless missing/unknown
-  python scripts/update_song_meta_ollama.py --collection tamil_songs
-
-  # dry run (no qdrant updates)
-  python scripts/update_song_meta_ollama.py --collection tamil_songs --dry-run
+- Dedupes by payload["song_id"] (since multiple chunks per song)
+- Uses up to N chars of lyrics (Tamil/Tanglish/English) to classify
+- Writes payload updates back to ALL Qdrant points that share that song_id
+- Compatible with older qdrant-client versions (doesn't require set_payload(filter=...))
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import re
+import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as rest
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 
-# -------------------------
-# Helpers: text extraction
-# -------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-LIKELY_LYRICS_FIELDS = [
-    "lyrics_tamil",
-    "lyrics_tanglish",
-    "lyrics",
-    "lyrics_text",
-    "chunk_text",
-    "text",
-    "content",
-]
 
-def _clean(s: str) -> str:
-    s = re.sub(r"\s+", " ", (s or "")).strip()
-    return s
+def _safe_str(x: Any) -> str:
+    return "" if x is None else str(x)
 
-def _extract_lyrics_excerpt(payload: Dict[str, Any], max_chars: int = 500) -> str:
+
+def pick_lyrics(payload: Dict[str, Any], max_chars: int = 500) -> str:
     """
-    Try to extract lyrics-ish text from payload.
-    Prefers explicit lyrics fields, falls back to chunk_text.
+    Pick best available lyrics text from payload.
+    Supports common keys seen in your dataset.
     """
-    parts: List[str] = []
-    for k in LIKELY_LYRICS_FIELDS:
-        v = payload.get(k)
-        if isinstance(v, str) and v.strip():
-            parts.append(v.strip())
-
-    if not parts:
-        return ""
-
-    # Join but keep it short
-    joined = _clean(" \n".join(parts))
-    return joined[:max_chars]
-
-def _build_llm_context(payload: Dict[str, Any], max_lyrics_chars: int = 500) -> str:
-    title = payload.get("title") or ""
-    movie = payload.get("movie") or ""
-    year = payload.get("year") or ""
-    artist = payload.get("artist") or payload.get("singer") or ""
-
-    lyrics = _extract_lyrics_excerpt(payload, max_chars=max_lyrics_chars)
-
-    ctx = []
-    if title: ctx.append(f"Title: {title}")
-    if movie: ctx.append(f"Movie: {movie}")
-    if year: ctx.append(f"Year: {year}")
-    if artist: ctx.append(f"Artist: {artist}")
-    if lyrics: ctx.append(f"Lyrics excerpt (may contain Tamil/Tanglish): {lyrics}")
-
-    return "\n".join(ctx).strip()
+    candidates = [
+        payload.get("lyrics_tamil"),
+        payload.get("lyrics_tanglish"),
+        payload.get("lyrics_text"),
+        payload.get("lyrics"),
+        payload.get("text"),
+        payload.get("chunk_text"),
+        payload.get("content"),
+    ]
+    txt = ""
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            txt = c.strip()
+            break
+    txt = re.sub(r"\s+", " ", txt).strip()
+    if len(txt) > max_chars:
+        txt = txt[:max_chars].rstrip() + "…"
+    return txt
 
 
-# -------------------------
-# Ollama call + parsing
-# -------------------------
-
-MOOD_LABELS = [
-    "romantic",
-    "happy",
-    "sad",
-    "melancholic",
-    "kuthu",
-    "devotional",
-    "angry",
-    "inspirational",
-    "moivation",
-    "unknown",
-]
-
-GENRE_LABELS = [
-    "melody",
-    "romantic_melody",
-    "dance",
-    "kuthu",
-    "folk",
-    "gaana",
-    "devotional",
-    "classical",
-    "hip_hop",
-    "rock",
-    "pop",
-    "item",
-    "unknown",
-]
-
-RHYTHM_LABELS = [
-    "slow",
-    "mid",
-    "fast",
-    "unknown",
-]
-
-
-def _post_with_retry(url: str, payload: dict, timeout_s: int, retries: int = 3, backoff_s: float = 2.0):
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            return requests.post(url, json=payload, timeout=timeout_s)
-        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
-            last_err = e
-            time.sleep(backoff_s * attempt)
-    raise last_err
-
-def _ollama_classify(
-    ollama_url: str,
-    model: str,
-    ctx: str,
-    timeout_s: int = 600,
-    retries: int = 3
-) -> Optional[Dict[str, Any]]:
+def _extract_json_from_text(s: str) -> Optional[dict]:
     """
-    Calls Ollama and expects STRICT JSON output.
-    Returns dict: {mood, genre, rhythm, confidence}
+    Models sometimes wrap JSON with extra text. Try to recover.
     """
-    system = (
-        "You are a music metadata classifier for Tamil songs.\n"
-        "Given title/movie/year and a short lyrics excerpt, classify:\n"
-        f"- mood: one of {MOOD_LABELS}\n"
-        f"- genre: one of {GENRE_LABELS}\n"
-        f"- rhythm: one of {RHYTHM_LABELS} (tempo)\n"
-        "Return ONLY valid JSON (no markdown, no commentary).\n"
-        "If unsure, use 'unknown' and lower confidence.\n"
-    )
-
-    user = (
-        "Classify this song.\n\n"
-        "Output JSON schema:\n"
-        '{"mood":"...", "genre":"...", "rhythm":"...", "confidence":0.0}\n\n'
-        f"Song info:\n{ctx}\n"
-    )
-
-    # Use /api/chat when available (more controllable), fallback to /api/generate if needed.
-    chat_payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 120},
-    }
-
-    url = f"{ollama_url.rstrip('/')}/api/chat"
-    r = _post_with_retry(url, chat_payload, timeout_s=timeout_s, retries=retries)
-    r.raise_for_status()
-    
-    data = r.json()
-
-    # ✅ RAW model text (this is what you want to see)
-    raw_text = (data.get("message") or {}).get("content", "")
-    if debug:
-        print("\n" + "=" * 80)
-        print(f"[LLM RAW OUTPUT]")
-        print(raw_text)
-        print("=" * 80 + "\n")
-
-    
-    if r.status_code != 200:
+    s = s.strip()
+    if not s:
         return None
 
-    content = (r.json().get("message") or {}).get("content") or ""
-    content = content.strip()
+    # If it's valid JSON already
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
 
-    # Extract the first JSON object from the response
-    m = re.search(r"\{.*\}", content, re.S)
+    # Try to find first {...} block
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
     if not m:
         return None
-
+    blob = m.group(0)
     try:
-        obj = json.loads(m.group(0))
+        return json.loads(blob)
     except Exception:
         return None
 
-    # Normalize / validate
-    mood = obj.get("mood", "unknown")
-    genre = obj.get("genre", "unknown")
-    rhythm = obj.get("rhythm", "unknown")
-    conf = obj.get("confidence", 0.3)
 
-    if mood not in MOOD_LABELS:
-        mood = "unknown"
-    if genre not in GENRE_LABELS:
-        genre = "unknown"
-    if rhythm not in RHYTHM_LABELS:
-        rhythm = "unknown"
-
-    try:
-        conf = float(conf)
-    except Exception:
-        conf = 0.3
-    conf = max(0.0, min(conf, 1.0))
-
-    return {"mood": mood, "genre": genre, "rhythm": rhythm, "confidence": conf}
+# -----------------------------
+# Qdrant reading / writing
+# -----------------------------
 
 
-# -------------------------
-# Qdrant scan + upsert
-# -------------------------
-
-def _iter_unique_songs(
-    client: QdrantClient,
-    collection: str,
-    page_size: int = 256,
-    limit_songs: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+def iter_points(qc: QdrantClient, collection: str, page_size: int = 256):
     """
-    Scroll Qdrant points, dedup by song_id, return representative payload per song.
+    Scroll through Qdrant points (payload only).
     """
     offset = None
-    seen: Dict[str, Dict[str, Any]] = {}
-
     while True:
-        points, next_offset = client.scroll(
+        points, offset = qc.scroll(
             collection_name=collection,
             limit=page_size,
             offset=offset,
             with_payload=True,
             with_vectors=False,
         )
-
-        for p in points:
-            payload = p.payload or {}
-            sid = payload.get("song_id")
-            if not sid:
-                continue
-            if sid in seen:
-                # keep first seen (or you can prefer richer one if you want)
-                continue
-            seen[sid] = payload
-
-            if limit_songs and len(seen) >= limit_songs:
-                return [{"song_id": k, "payload": v} for k, v in seen.items()]
-
-        if not next_offset:
+        if not points:
             break
-        offset = next_offset
+        for p in points:
+            yield p
+        if offset is None:
+            break
 
-    return [{"song_id": k, "payload": v} for k, v in seen.items()]
 
-def _needs_update(
-    payload: Dict[str, Any],
-    force: bool,
-) -> bool:
+def load_checkpoint(path: Optional[str]) -> set[str]:
+    done: set[str] = set()
+    if not path:
+        return done
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                sid = line.strip()
+                if sid:
+                    done.add(sid)
+    return done
+
+
+def append_checkpoint(path: Optional[str], song_id: str):
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(song_id + "\n")
+
+
+def get_point_ids_for_song(qc: QdrantClient, collection: str, song_id: str, page_size: int = 256) -> List[Any]:
     """
-    Default behavior: update only if missing/unknown.
-    If force=True: update everything.
+    Find ALL point IDs in Qdrant that belong to a given song_id (multiple chunks).
+    Works with older client versions.
     """
-    if force:
-        return True
-
-    # Only if missing or unknown
-    mood = (payload.get("mood_llm") or payload.get("mood") or "").strip().lower()
-    genre = (payload.get("genre_llm") or payload.get("genre") or "").strip().lower()
-    rhythm = (payload.get("rhythm_llm") or payload.get("rhythm") or "").strip().lower()
-
-    def bad(x: str) -> bool:
-        return (not x) or (x == "unknown")
-
-    return bad(mood) or bad(genre) or bad(rhythm)
-
-def _upsert_song_payload_by_song_id(
-    client: QdrantClient,
-    collection: str,
-    song_id: str,
-    payload_updates: Dict[str, Any],
-) -> None:
-    """
-    Update ALL chunks for a song_id using FilterSelector.
-    This avoids the 'missing points' / 'unknown filter arg' issues.
-    """
-    selector = rest.FilterSelector(
-        filter=rest.Filter(
-            must=[
-                rest.FieldCondition(
-                    key="song_id",
-                    match=rest.MatchValue(value=song_id),
-                )
-            ]
+    ids: List[Any] = []
+    offset = None
+    while True:
+        points, offset = qc.scroll(
+            collection_name=collection,
+            limit=page_size,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+            scroll_filter={
+                "must": [{"key": "song_id", "match": {"value": song_id}}],
+            },
         )
-    )
-    client.set_payload(
+        if not points:
+            break
+        for p in points:
+            ids.append(p.id)
+        if offset is None:
+            break
+    return ids
+
+
+def upsert_payload_for_song(qc: QdrantClient, collection: str, song_id: str, payload_updates: Dict[str, Any]) -> int:
+    """
+    Update payload for all chunks belonging to song_id.
+    Returns number of points updated.
+    """
+    point_ids = get_point_ids_for_song(qc, collection, song_id)
+    if not point_ids:
+        return 0
+
+    # Older qdrant-client requires "points" positional arg
+    qc.set_payload(
         collection_name=collection,
         payload=payload_updates,
-        points=selector,
+        points=point_ids,
+    )
+    return len(point_ids)
+
+
+# -----------------------------
+# Ollama
+# -----------------------------
+
+
+SYSTEM_PROMPT = """You are a music metadata classifier for Tamil songs.
+You will be given: title, movie, year, and a short lyrics excerpt (Tamil or Tanglish).
+Return ONLY valid JSON with these keys exactly:
+{
+  "mood": "romantic|happy|sad|melancholic|kuthu|devotional|angry|inspirational|nostalgic|unknown",
+  "genre": "melody|folk|gaana|kuthu|classical|devotional|romantic|dance|hiphop|rock|pop|unknown",
+  "rhythm": "slow|mid|fast|unknown",
+  "confidence": 0.0,
+  "why": "short reason"
+}
+Rules:
+- confidence must be between 0 and 1.
+- If unsure, set unknown and low confidence.
+- No extra keys, no markdown, no explanations outside JSON.
+"""
+
+
+def ollama_classify(
+    ollama_url: str,
+    model: str,
+    title: str,
+    movie: str,
+    year: str,
+    lyrics_excerpt: str,
+    timeout_s: int,
+    print_raw: bool,
+) -> Tuple[Optional[dict], str]:
+    """
+    Returns (parsed_json, raw_text)
+    """
+    user_prompt = (
+        f"TITLE: {title}\n"
+        f"MOVIE: {movie}\n"
+        f"YEAR: {year}\n"
+        f"LYRICS_EXCERPT:\n{lyrics_excerpt}\n"
     )
 
+    payload = {
+        "model": model,
+        "stream": False,
+        # Many Ollama builds support format="json" for tighter output.
+        # If your Ollama doesn't support it, it will still usually work with the strict system prompt.
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        # Keep it short and deterministic
+        "options": {
+            "temperature": 0.1,
+        },
+    }
 
-# -------------------------
+    r = requests.post(f"{ollama_url.rstrip('/')}/api/chat", json=payload, timeout=timeout_s)
+    r.raise_for_status()
+    data = r.json()
+
+    raw = ""
+    # Ollama /api/chat returns {"message":{"content":"..."}}
+    if isinstance(data, dict):
+        raw = _safe_str((data.get("message") or {}).get("content"))
+    raw = raw.strip()
+
+    if print_raw:
+        print("\n================================================================================")
+        print("[LLM RAW OUTPUT]")
+        print(raw)
+        print("================================================================================\n")
+
+    parsed = _extract_json_from_text(raw)
+    return parsed, raw
+
+
+def normalize_meta(meta: dict) -> dict:
+    """
+    Ensure schema + sanitize values
+    """
+    mood = _safe_str(meta.get("mood")).strip().lower()
+    genre = _safe_str(meta.get("genre")).strip().lower()
+    rhythm = _safe_str(meta.get("rhythm")).strip().lower()
+
+    try:
+        conf = float(meta.get("confidence", 0.0))
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+
+    why = _safe_str(meta.get("why")).strip()
+    if len(why) > 200:
+        why = why[:200].rstrip() + "…"
+
+    return {
+        "mood_llm": mood or "unknown",
+        "genre_llm": genre or "unknown",
+        "rhythm_llm": rhythm or "unknown",
+        "meta_llm_confidence": conf,
+        "meta_llm_why": why,
+    }
+
+
+# -----------------------------
 # Main
-# -------------------------
+# -----------------------------
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--qdrant-url", default=os.getenv("QDRANT_URL", "http://localhost:6333"))
+    ap = argparse.ArgumentParser(description="Backfill mood/genre/rhythm using local Ollama model.")
+    ap.add_argument("--qdrant-url", default="http://localhost:6333")
     ap.add_argument("--collection", required=True)
-    ap.add_argument("--ollama-url", default=os.getenv("OLLAMA_URL", "http://localhost:11434"))
-    ap.add_argument("--model", default=os.getenv("OLLAMA_MODEL", "smollm2:135m"))
-
+    ap.add_argument("--ollama-url", default="http://localhost:11434")
+    ap.add_argument("--model", default="smollm2:135m")
     ap.add_argument("--page-size", type=int, default=256)
-    ap.add_argument("--limit", type=int, default=0, help="Limit number of unique songs (0 = all)")
-    ap.add_argument("--sleep-ms", type=int, default=0, help="Sleep between LLM calls")
-
-    ap.add_argument("--force", action="store_true", help="Overwrite even if mood/genre/rhythm already present")
-    ap.add_argument("--write-canonical", action="store_true",
-                    help="Also overwrite canonical fields mood/genre/rhythm (default writes *_llm only)")
+    ap.add_argument("--sleep-ms", type=int, default=0)
+    ap.add_argument("--timeout-s", type=int, default=180, help="Ollama request timeout in seconds")
+    ap.add_argument("--checkpoint", default="scripts/.checkpoint_song_meta.txt")
+    ap.add_argument("--force", action="store_true", help="Recompute even if mood_llm/genre_llm/rhythm_llm already exist")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--debug-every", type=int, default=25)
+    ap.add_argument("--print-raw", action="store_true", help="Print raw LLM output for each processed song")
+    ap.add_argument("--max-songs", type=int, default=None, help="Process only N songs (debug runs)")
 
-    ap.add_argument("--checkpoint", default="song_meta_checkpoint.jsonl",
-                    help="JSONL file to store processed song_ids (resume support)")
-    
-    ap.add_argument("--debug", action="store_true", help="Print raw LLM output + parsed result")
-    ap.add_argument("--debug-every", type=int, default=1, help="Print debug every N songs")
-
-    ap.add_argument(
-    "--print-raw",
-    action="store_true",
-    help="Print raw LLM output before JSON parsing",
-    )
-
-    ap.add_argument(
-        "--max-songs",
-        type=int,
-        default=None,
-        help="Process only N unique songs (debug runs)",
-    )
     args = ap.parse_args()
-    max_songs = args.max_songs or args.limit
-    limit_songs = args.limit if args.limit and args.limit > 0 else None
 
-    client = QdrantClient(url=args.qdrant_url)
+    qc = QdrantClient(url=args.qdrant_url)
 
-    # Load checkpoint (already processed)
-    done = set()
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        with open(args.checkpoint, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                    sid = rec.get("song_id")
-                    if sid:
-                        done.add(sid)
-                except Exception:
-                    pass
+    done = load_checkpoint(args.checkpoint)
 
-    songs = _iter_unique_songs(
-        client=client,
-        collection=args.collection,
-        page_size=args.page_size,
-        limit_songs=limit_songs,
-    )
+    # Collect unique songs (dedupe by song_id)
+    unique: Dict[str, Dict[str, Any]] = {}
+    for p in iter_points(qc, args.collection, page_size=args.page_size):
+        payload = getattr(p, "payload", None) or {}
+        sid = payload.get("song_id")
+        if not sid:
+            continue
+        if sid in unique:
+            continue
+        unique[sid] = payload
 
-    print(f"Unique songs found: {len(songs)} (checkpointed: {len(done)})")
+    song_ids = list(unique.keys())
+    if args.max_songs:
+        song_ids = song_ids[: args.max_songs]
 
-    updated = 0
+    print(f"Unique songs found: {len(unique)} (checkpointed: {len(done)})")
+    total = len(song_ids)
+
+    updated_songs = 0
     skipped = 0
     failed = 0
 
-    ckpt_f = open(args.checkpoint, "a", encoding="utf-8") if args.checkpoint else None
-    
+    for idx, sid in enumerate(song_ids, start=1):
+        payload = unique[sid]
 
-    try:
-        for idx, row in enumerate(songs, 1):
-            song_id = row["song_id"]
-            payload = row["payload"]
+        title = _safe_str(payload.get("title"))
+        movie = _safe_str(payload.get("movie"))
+        year = _safe_str(payload.get("year"))
 
-            if song_id in done:
-                skipped += 1
-                continue
+        lyrics_excerpt = pick_lyrics(payload, max_chars=500)
 
-            if not _needs_update(payload, force=args.force):
-                skipped += 1
-                if ckpt_f:
-                    ckpt_f.write(json.dumps({"song_id": song_id, "status": "skipped"}) + "\n")
-                    ckpt_f.flush()
-                continue
+        if not lyrics_excerpt:
+            skipped += 1
+            if args.debug:
+                print(f"[{idx}/{total}] SKIP no lyrics: {sid} {title}")
+            append_checkpoint(args.checkpoint, sid)
+            continue
 
-            ctx = _build_llm_context(payload, max_lyrics_chars=500)
-            if not ctx:
-                failed += 1
-                if ckpt_f:
-                    ckpt_f.write(json.dumps({"song_id": song_id, "status": "no_text"}) + "\n")
-                    ckpt_f.flush()
-                continue
+        already = payload.get("mood_llm") and payload.get("genre_llm") and payload.get("rhythm_llm")
+        if already and not args.force:
+            skipped += 1
+            if args.debug and (idx % args.debug_every == 0):
+                print(f"[{idx}/{total}] SKIP already has llm meta: {sid}")
+            append_checkpoint(args.checkpoint, sid)
+            continue
 
-            meta = _ollama_classify(
+        if args.debug and (idx % args.debug_every == 0 or args.debug_every == 1):
+            print("\n" + "-" * 60)
+            print(f"Song ID: {sid}")
+            print(f"Title: {title} | Movie: {movie} | Year: {year}")
+            print(f"Lyrics excerpt: {lyrics_excerpt}")
+            print("-" * 60)
+
+        try:
+            meta, raw = ollama_classify(
                 ollama_url=args.ollama_url,
                 model=args.model,
-                ctx=ctx,
-                timeout_s=60,
-                debug=args.debug,
-                
+                title=title,
+                movie=movie,
+                year=year,
+                lyrics_excerpt=lyrics_excerpt,
+                timeout_s=args.timeout_s,
+                print_raw=args.print_raw,
             )
 
             if not meta:
                 failed += 1
-                if ckpt_f:
-                    ckpt_f.write(json.dumps({"song_id": song_id, "status": "llm_failed"}) + "\n")
-                    ckpt_f.flush()
-                continue
-
-            now = datetime.utcnow().isoformat() + "Z"
-            updates = {
-                "mood_llm": meta["mood"],
-                "genre_llm": meta["genre"],
-                "rhythm_llm": meta["rhythm"],
-                "meta_source": f"ollama:{args.model}",
-                "meta_confidence": meta["confidence"],
-                "meta_updated_at": now,
-            }
-
-            # Optionally overwrite canonical fields too
-            if args.write_canonical:
-                updates["mood"] = meta["mood"]
-                updates["genre"] = meta["genre"]
-                updates["rhythm"] = meta["rhythm"]
+                # Still mark status in qdrant so we can detect failures later
+                payload_updates = {
+                    "meta_llm_status": "failed",
+                    "meta_llm_updated_at": utc_now_iso(),
+                    "meta_llm_source": f"ollama:{args.model}",
+                    "meta_llm_error": "empty_or_unparseable_json",
+                }
+            else:
+                norm = normalize_meta(meta)
+                payload_updates = {
+                    **norm,
+                    "meta_llm_status": "ok",
+                    "meta_llm_updated_at": utc_now_iso(),
+                    "meta_llm_source": f"ollama:{args.model}",
+                }
 
             if args.dry_run:
-                updated += 1
+                # No write
+                pass
             else:
-                _upsert_song_payload_by_song_id(
-                    client=client,
-                    collection=args.collection,
-                    song_id=song_id,
-                    payload_updates=updates,
-                )
-                updated += 1
+                upsert_payload_for_song(qc, args.collection, sid, payload_updates)
 
-            if ckpt_f:
-                ckpt_f.write(json.dumps({"song_id": song_id, "status": "updated", **updates}) + "\n")
-                ckpt_f.flush()
+            if payload_updates.get("meta_llm_status") == "ok":
+                updated_songs += 1
 
-            if args.sleep_ms > 0:
-                time.sleep(args.sleep_ms / 1000.0)
+        except requests.exceptions.ReadTimeout:
+            failed += 1
+            if args.debug:
+                print(f"[{idx}/{total}] TIMEOUT on Ollama for song_id={sid}")
+        except Exception as e:
+            failed += 1
+            if args.debug:
+                print(f"[{idx}/{total}] ERROR song_id={sid}: {e}")
 
-            if idx % 25 == 0:
-                print(f"[{idx}/{len(songs)}] updated={updated} skipped={skipped} failed={failed}")
-                
-            if max_songs and processed >= max_songs:
-                break
+        append_checkpoint(args.checkpoint, sid)
 
-    finally:
-        if ckpt_f:
-            ckpt_f.close()
+        if args.sleep_ms and args.sleep_ms > 0:
+            time.sleep(args.sleep_ms / 1000.0)
 
-    print(f"Done. updated={updated}, skipped={skipped}, failed={failed}")
-    if args.dry_run:
-        print("Dry-run mode ON (no Qdrant writes).")
+        if idx % max(1, args.debug_every) == 0:
+            print(f"[{idx}/{total}] updated_songs={updated_songs} skipped={skipped} failed={failed}")
+
+    print("\nDONE")
+    print(f"updated_songs={updated_songs} skipped={skipped} failed={failed}")
+    print(f"checkpoint={args.checkpoint}")
 
 
 if __name__ == "__main__":

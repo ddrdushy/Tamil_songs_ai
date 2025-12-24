@@ -74,3 +74,4 @@ archive/
 __pycache__/
 *.pyc
 
+tamil-ai-music/rag-ingestion/scripts/.checkpoint_song_meta.txt
