@@ -2,26 +2,45 @@
 """
 classify_with_web.py
 
-Classify Tamil songs into mood / genre / rhythm using:
-- lyrics excerpt (up to N chars)
-- optional web search snippets (DuckDuckGo HTML)
-- local Ollama model (qwen2.5:3b recommended)
+Classify Tamil songs into mood/genre/rhythm using:
+- Local Ollama model (qwen2.5:3b recommended)
+- Lyrics excerpt (Tamil / Tanglish)
+- Optional web snippets (DuckDuckGo HTML search)
 
-Updates Qdrant payload for ALL chunks belonging to each song_id:
-- mood_llm, genre_llm, rhythm_llm
-- meta_source, meta_confidence, meta_updated_at
-- optionally canonical fields mood/genre/rhythm if --write-canonical
+Then upsert payload into Qdrant for ALL chunks of each song_id.
+Compatible with older qdrant-client where set_payload requires `points` (IDs)
+and does not accept filter/points_selector kwargs.
 
-Usage example:
+Usage examples:
+
+# Update only missing (unknown/empty) meta fields
 python scripts/classify_with_web.py \
   --qdrant-url http://localhost:6333 \
   --collection songs_lyrics_v1 \
   --ollama-url http://localhost:11434 \
   --model qwen2.5:3b \
   --only-missing \
-  --websearch \
-  --print-raw --debug --debug-every 1 --max-songs 10 \
-  --checkpoint .checkpoint_meta_run3.jsonl
+  --debug-every 1 \
+  --print-raw
+
+# Force update ALL songs (rebuild meta)
+python scripts/classify_with_web.py \
+  --qdrant-url http://localhost:6333 \
+  --collection songs_lyrics_v1 \
+  --ollama-url http://localhost:11434 \
+  --model qwen2.5:3b \
+  --force \
+  --checkpoint .checkpoint_meta_force.jsonl
+
+# Fix bad youtube_url records too (search-query URLs)
+python scripts/classify_with_web.py \
+  --qdrant-url http://localhost:6333 \
+  --collection songs_lyrics_v1 \
+  --ollama-url http://localhost:11434 \
+  --model qwen2.5:3b \
+  --only-missing \
+  --fix-bad-youtube \
+  --checkpoint .checkpoint_meta_run2.jsonl
 """
 
 from __future__ import annotations
@@ -30,539 +49,556 @@ import argparse
 import datetime as dt
 import json
 import os
+import random
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as rest
 
 
-# ----------------------------
-# Controlled label taxonomy
-# ----------------------------
-MOODS = [
-    "romantic",
-    "happy",
-    "sad",
-    "melancholic",
-    "angry",
-    "inspirational",
-    "devotional",
-    "kuthu",
-    "celebration",
-    "nostalgia",
-    "unknown",
-]
+# ---------------------------
+# Helpers
+# ---------------------------
 
-GENRES = [
-    "romantic",
-    "devotional",
-    "folk",
-    "kuthu",
-    "melody",
-    "dance",
-    "classical",
-    "hiphop",
-    "rock",
-    "love_duet",
-    "sad",
-    "unknown",
-]
-
-RHYTHMS = [
-    "slow",
-    "mid",
-    "fast",
-    "unknown",
-]
-
-BAD_VALUES = {None, "", "unknown", "na", "n/a", "none", "null"}
-
-
-def _now_iso() -> str:
+def now_iso() -> str:
     return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _norm(s: Optional[str]) -> str:
-    if s is None:
-        return "unknown"
-    s = str(s).strip().lower()
-    s = re.sub(r"[\s\-]+", "_", s)
-    s = re.sub(r"[^a-z0-9_]+", "", s)
-    return s or "unknown"
+def safe_str(x: Any) -> str:
+    return "" if x is None else str(x)
 
 
-def _canonicalize(label: str, allowed: List[str]) -> str:
-    x = _norm(label)
-    # common aliases
-    alias = {
-        "melodic": "melody",
-        "melodious": "melody",
-        "sentimental": "melancholic",
-        "party": "celebration",
-        "uplifting": "inspirational",
-        "spiritual": "devotional",
-        "duet": "love_duet",
-        "love": "romantic",
-        "beat": "fast",
-        "medium": "mid",
-        "moderate": "mid",
-    }
-    x = alias.get(x, x)
-    return x if x in allowed else "unknown"
+def clamp_text(s: str, max_chars: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 1].rstrip() + "…"
 
 
-def _is_missing(v: Optional[str]) -> bool:
-    return _norm(v) in BAD_VALUES
+def load_checkpoint(path: str) -> set[str]:
+    if not path or not os.path.exists(path):
+        return set()
+    done = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                sid = obj.get("song_id")
+                if sid:
+                    done.add(sid)
+            except Exception:
+                continue
+    return done
 
 
-def _strip_noise(text: str) -> str:
-    """Remove common credit lines in lyrics to reduce confusion."""
-    if not text:
-        return ""
-    t = text
-    # remove common headers (Tamil + English patterns)
-    t = re.sub(r"(singers?\s*:.*)", "", t, flags=re.I)
-    t = re.sub(r"(music\s+director\s*:.*)", "", t, flags=re.I)
-    t = re.sub(r"(lyricist\s*:.*)", "", t, flags=re.I)
-    t = re.sub(r"(பாடகர்\s*:.*)", "", t)
-    t = re.sub(r"(பாடகி\s*:.*)", "", t)
-    t = re.sub(r"(இசை\s+அமைப்பாளர்\s*:.*)", "", t)
-    t = re.sub(r"(பாடலாசிரியர்\s*:.*)", "", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+def append_checkpoint(path: str, rec: dict) -> None:
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-# ----------------------------
+# ---------------------------
 # Web search (DuckDuckGo HTML)
-# ----------------------------
-def _ddg_search_snippets(query: str, k: int = 3, timeout_s: int = 20, sleep_ms: int = 200) -> List[str]:
+# ---------------------------
+
+DUCK_URL = "https://html.duckduckgo.com/html/"
+
+
+def ddg_search(query: str, top_k: int = 3, timeout_s: int = 15) -> List[Dict[str, str]]:
     """
-    Lightweight web search without API keys.
-    Uses DuckDuckGo HTML endpoint and extracts result snippets.
+    Very lightweight web 'search' without API keys.
+    Returns list of {title, url, snippet}.
     """
-    if not query.strip():
+    query = (query or "").strip()
+    if not query:
         return []
 
-    url = "https://duckduckgo.com/html/"
     headers = {
-        "User-Agent": "Mozilla/5.0 (TamilMusicAI/1.0; +https://example.com)",
+        "User-Agent": "TamilMusicAI/1.0 (+local-script)",
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    try:
-        time.sleep(max(0, sleep_ms) / 1000.0)
-        r = requests.post(url, data={"q": query}, headers=headers, timeout=timeout_s)
-        if r.status_code != 200:
-            return []
-        html = r.text
 
-        # Extract snippets; DDG uses <a class="result__snippet"> or <div class="result__snippet">
-        snippets = re.findall(r'result__snippet[^>]*>(.*?)<', html)
-        clean: List[str] = []
-        for sn in snippets:
-            sn = re.sub(r"<.*?>", "", sn)
-            sn = re.sub(r"&nbsp;|&amp;|&quot;|&#39;", " ", sn)
-            sn = re.sub(r"\s+", " ", sn).strip()
-            if sn and sn not in clean:
-                clean.append(sn)
-            if len(clean) >= k:
-                break
-        return clean[:k]
+    try:
+        r = requests.post(
+            DUCK_URL,
+            data={"q": query},
+            headers=headers,
+            timeout=timeout_s,
+        )
+        r.raise_for_status()
+        html = r.text
     except Exception:
         return []
 
+    # Basic parsing via regex (good enough for snippets)
+    results = []
+    # Each result block typically contains: result__a (title/url) and result__snippet
+    link_pat = re.compile(r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+    snip_pat = re.compile(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', re.S)
 
-# ----------------------------
-# Ollama call + robust JSON parse
-# ----------------------------
-def _extract_json_block(text: str) -> Optional[dict]:
-    """Try to locate a JSON object inside text."""
-    if not text:
-        return None
-    text = text.strip()
+    links = link_pat.findall(html)
+    snippets = snip_pat.findall(html)
 
-    # direct parse
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
+    def strip_tags(x: str) -> str:
+        x = re.sub(r"<[^>]+>", " ", x)
+        x = re.sub(r"\s+", " ", x).strip()
+        return x
 
-    # find first {...} block
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if m:
-        block = m.group(0)
-        try:
-            return json.loads(block)
-        except Exception:
-            return None
-    return None
+    for i, (url, title_html) in enumerate(links[:top_k]):
+        title = strip_tags(title_html)
+        snip = strip_tags(snippets[i]) if i < len(snippets) else ""
+        results.append({"title": title, "url": url, "snippet": snip})
+
+    return results
 
 
-def _ollama_classify(
+# ---------------------------
+# Ollama classify
+# ---------------------------
+
+ALLOWED_MOODS = ["romantic", "happy", "sad", "melancholic", "kuthu", "devotional", "angry", "inspirational", "unknown"]
+ALLOWED_GENRES = ["love", "dance", "celebration", "heartbreak", "friendship", "devotion", "nostalgia", "folk", "melody", "unknown"]
+ALLOWED_RHYTHMS = ["fast", "medium", "slow", "unknown"]
+
+
+def build_prompt(title: str, movie: str, year: str, lyrics_excerpt: str, web_snips: List[Dict[str, str]]) -> str:
+    """
+    Prompt designed to reduce random wrong labels.
+    Enforces fixed enums + JSON-only output.
+    """
+    web_block = ""
+    if web_snips:
+        lines = []
+        for i, it in enumerate(web_snips, 1):
+            lines.append(f"{i}. {it.get('title','')}\n   {it.get('snippet','')}\n   {it.get('url','')}")
+        web_block = "\n\nWEB SNIPPETS (may be noisy):\n" + "\n".join(lines)
+
+    return f"""
+You are a music metadata classifier for Tamil songs.
+
+TASK:
+Given the song info and lyrics excerpt, classify:
+- mood: one of {ALLOWED_MOODS}
+- genre: one of {ALLOWED_GENRES}
+- rhythm: one of {ALLOWED_RHYTHMS}
+
+IMPORTANT RULES:
+1) Only output valid JSON (no markdown, no commentary).
+2) Choose exactly ONE label for each field.
+3) If evidence is insufficient or unclear, output "unknown".
+4) Prefer lyrics meaning + tone. Do NOT guess devotional/folk unless strongly indicated.
+5) rhythm:
+   - "fast" for energetic/dance/kuthu/party feel
+   - "slow" for emotional/ballad/soft devotional
+   - "medium" otherwise
+
+Return JSON with keys:
+{{
+  "mood": "...",
+  "genre": "...",
+  "rhythm": "...",
+  "confidence": 0.0-1.0,
+  "why": "one short sentence"
+}}
+
+SONG:
+Title: {title}
+Movie: {movie}
+Year: {year}
+
+LYRICS EXCERPT (may include Tamil/Tanglish):
+{lyrics_excerpt}
+{web_block}
+""".strip()
+
+
+def ollama_chat(
     ollama_url: str,
     model: str,
-    title: str,
-    movie: Optional[str],
-    year: Optional[str],
-    lyrics_excerpt: str,
-    web_snippets: List[str],
+    prompt: str,
     timeout_s: int = 180,
-    debug: bool = False,
-) -> Tuple[Optional[dict], str]:
+) -> Tuple[str, Optional[dict]]:
     """
-    Returns (parsed_json, raw_text)
+    Returns (raw_text, parsed_json_or_none)
     """
-    system = (
-        "You are a music metadata classifier for Tamil songs.\n"
-        "You MUST follow the taxonomy exactly.\n\n"
-        f"Allowed moods: {MOODS}\n"
-        f"Allowed genres: {GENRES}\n"
-        f"Allowed rhythms: {RHYTHMS}\n\n"
-        "Rules:\n"
-        "- Choose EXACTLY ONE value for mood, genre, rhythm.\n"
-        "- If unsure, output 'unknown'.\n"
-        "- confidence must be a float 0.0..1.0\n"
-        "- Output JSON ONLY. No markdown, no extra commentary.\n"
-    )
-
-    web_context = ""
-    if web_snippets:
-        # Keep it small so it doesn't overwhelm lyrics
-        joined = " | ".join(web_snippets[:3])
-        web_context = f"\nWeb snippets (may help): {joined}\n"
-
-    user = (
-        f"Song title: {title}\n"
-        f"Movie: {movie or 'unknown'}\n"
-        f"Year: {year or 'unknown'}\n"
-        f"{web_context}\n"
-        "Lyrics excerpt:\n"
-        f"{lyrics_excerpt}\n\n"
-        "Return JSON with keys: mood, genre, rhythm, confidence, why\n"
-        "where mood/genre/rhythm must be from the allowed lists.\n"
-    )
-
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "system", "content": "You output ONLY strict JSON as requested."},
+            {"role": "user", "content": prompt},
         ],
         "stream": False,
-        # Ollama supports forcing JSON for many models:
-        "format": "json",
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 180,
-        },
+        # Some models behave better with lower temperature for classification:
+        "options": {"temperature": 0.2},
     }
 
     r = requests.post(f"{ollama_url.rstrip('/')}/api/chat", json=payload, timeout=timeout_s)
     r.raise_for_status()
-    j = r.json()
-    raw = (j.get("message") or {}).get("content") or ""
+    data = r.json()
 
-    parsed = _extract_json_block(raw)
-    if debug and not parsed:
-        # sometimes model returns empty; keep raw for visibility
-        return None, raw
+    content = (
+        data.get("message", {}).get("content")
+        or data.get("response")
+        or ""
+    ).strip()
 
-    return parsed, raw
+    # Extract first JSON object if model adds junk
+    parsed = None
+    if content:
+        m = re.search(r"\{.*\}", content, re.S)
+        if m:
+            candidate = m.group(0)
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                parsed = None
+    return content, parsed
 
 
-# ----------------------------
+def normalize_meta(meta: dict) -> Optional[dict]:
+    if not meta:
+        return None
+
+    mood = safe_str(meta.get("mood")).strip().lower()
+    genre = safe_str(meta.get("genre")).strip().lower()
+    rhythm = safe_str(meta.get("rhythm")).strip().lower()
+
+    if mood not in ALLOWED_MOODS:
+        mood = "unknown"
+    if genre not in ALLOWED_GENRES:
+        genre = "unknown"
+    if rhythm not in ALLOWED_RHYTHMS:
+        rhythm = "unknown"
+
+    try:
+        conf = float(meta.get("confidence", 0.0))
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+
+    why = clamp_text(safe_str(meta.get("why")), 200)
+
+    return {"mood": mood, "genre": genre, "rhythm": rhythm, "confidence": conf, "why": why}
+
+
+# ---------------------------
 # Qdrant helpers
-# ----------------------------
-def _scroll_unique_songs(
-    client: QdrantClient,
-    collection: str,
-    page_size: int,
-    limit: Optional[int],
-) -> List[Dict[str, Any]]:
+# ---------------------------
+
+def is_missing(payload: dict) -> bool:
     """
-    Returns a list of song objects:
-    {song_id, title, movie, year, lyrics_excerpt}
-    One per unique song_id.
+    'only-missing' = any of the llm fields are missing/unknown/empty.
     """
-    seen = {}
+    def bad(v: Any) -> bool:
+        s = safe_str(v).strip().lower()
+        return (not s) or (s == "unknown")
+
+    return bad(payload.get("mood_llm")) or bad(payload.get("genre_llm")) or bad(payload.get("rhythm_llm"))
+
+
+def is_bad_youtube_url(payload: dict) -> bool:
+    """
+    Old runs stored youtube 'search results' URLs instead of watch URLs.
+    We mark them as bad to re-fix later.
+    """
+    url = safe_str(payload.get("youtube_url")).strip()
+    if not url:
+        return False
+    return "youtube.com/results?search_query=" in url
+
+
+def get_unique_songs(client: QdrantClient, collection: str, page_size: int = 256, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Scroll all points, dedupe by song_id, keep minimal fields for processing.
+    NOTE: We'll also keep the first chunk_text as lyrics excerpt source.
+    """
+    songs: Dict[str, Dict[str, Any]] = {}
     offset = None
-    fetched_points = 0
+    total_seen = 0
 
     while True:
-        points, offset = client.scroll(
+        points, next_offset = client.scroll(
             collection_name=collection,
-            scroll_filter=None,
-            with_payload=True,
-            with_vectors=False,
             limit=page_size,
             offset=offset,
+            with_payload=True,
+            with_vectors=False,
         )
+
         if not points:
             break
 
         for p in points:
-            fetched_points += 1
+            total_seen += 1
             payload = p.payload or {}
             sid = payload.get("song_id")
-            if not sid or sid in seen:
+            if not sid:
                 continue
 
-            title = payload.get("title") or ""
-            movie = payload.get("movie")
-            year = payload.get("year")
-            # pick lyrics text field
-            txt = payload.get("chunk_text") or payload.get("lyrics_text") or ""
-            txt = _strip_noise(str(txt))
-            excerpt = txt[:500]  # you said 500 chars is fine
+            if sid not in songs:
+                songs[sid] = {
+                    "song_id": sid,
+                    "title": payload.get("title"),
+                    "movie": payload.get("movie"),
+                    "year": payload.get("year"),
+                    "song_url": payload.get("song_url"),
+                    "chunk_text": payload.get("chunk_text") or payload.get("lyrics_text") or payload.get("text") or "",
+                    "payload_sample": payload,  # for only-missing checks etc
+                }
 
-            # some records might not have lyrics in this chunk; still store; we might find later chunks via ids fetch
-            seen[sid] = {
-                "song_id": sid,
-                "title": title,
-                "movie": movie,
-                "year": str(year) if year is not None else None,
-                "lyrics_excerpt": excerpt,
-            }
-
-            if limit and len(seen) >= limit:
-                return list(seen.values())
-
-        if offset is None:
+        if limit and len(songs) >= limit:
             break
 
-    return list(seen.values())
+        if next_offset is None:
+            break
+        offset = next_offset
+
+    return list(songs.values())
 
 
-def _get_point_ids_for_song(client: QdrantClient, collection: str, song_id: str) -> List[str]:
-    """Collect ALL point IDs where payload.song_id == song_id."""
-    filt = rest.Filter(
-        must=[rest.FieldCondition(key="song_id", match=rest.MatchValue(value=song_id))]
-    )
-
-    ids: List[str] = []
+def get_point_ids_for_song(client: QdrantClient, collection: str, song_id: str, page_size: int = 256) -> List[Any]:
+    """
+    Collect ALL point IDs that belong to this song_id, by scrolling.
+    Compatible with older qdrant-client: we scroll + filter, then set_payload(points=[ids...])
+    """
+    ids = []
     offset = None
+
+    # Qdrant filter format as dict works across many versions
+    flt = {"must": [{"key": "song_id", "match": {"value": song_id}}]}
+
     while True:
-        points, offset = client.scroll(
+        pts, next_offset = client.scroll(
             collection_name=collection,
-            scroll_filter=filt,
+            scroll_filter=flt,
+            limit=page_size,
+            offset=offset,
             with_payload=False,
             with_vectors=False,
-            limit=256,
-            offset=offset,
         )
-        if not points:
+        if not pts:
             break
-        for p in points:
-            # Qdrant point id can be int or str; store as str
-            ids.append(str(p.id))
-        if offset is None:
+        for p in pts:
+            ids.append(p.id)
+        if next_offset is None:
             break
+        offset = next_offset
+
     return ids
 
 
-def _set_payload_for_song(client: QdrantClient, collection: str, song_id: str, payload_updates: Dict[str, Any]) -> int:
-    """Update payload on all points for a song."""
-    ids = _get_point_ids_for_song(client, collection, song_id)
-    if not ids:
+def upsert_payload_all_chunks(client: QdrantClient, collection: str, song_id: str, payload_updates: dict, page_size: int = 256) -> int:
+    """
+    Update payload for ALL chunks (points) belonging to song_id.
+    Returns number of points updated.
+    """
+    point_ids = get_point_ids_for_song(client, collection, song_id, page_size=page_size)
+    if not point_ids:
         return 0
-    client.set_payload(collection_name=collection, payload=payload_updates, points=ids)
-    return len(ids)
+
+    # Older clients require `points` positional/kw arg; no filter support.
+    client.set_payload(
+        collection_name=collection,
+        points=point_ids,
+        payload=payload_updates,
+    )
+    return len(point_ids)
 
 
-# ----------------------------
+# ---------------------------
 # Main
-# ----------------------------
-def main() -> None:
+# ---------------------------
+
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--qdrant-url", default="http://localhost:6333")
     ap.add_argument("--collection", required=True)
-
     ap.add_argument("--ollama-url", default="http://localhost:11434")
     ap.add_argument("--model", default="qwen2.5:3b")
 
-    ap.add_argument("--page-size", type=int, default=512)
-    ap.add_argument("--max-songs", type=int, default=0, help="Process only N songs (0 = all)")
+    ap.add_argument("--page-size", type=int, default=256)
+    ap.add_argument("--limit", type=int, default=None, help="Limit unique songs (for testing).")
+    ap.add_argument("--max-songs", type=int, default=None, help="Stop after N processed songs (debug).")
 
-    ap.add_argument("--only-missing", action="store_true", help="Only classify when llm fields are missing/unknown")
-    ap.add_argument("--write-canonical", action="store_true", help="Also write mood/genre/rhythm canonical fields")
+    ap.add_argument("--sleep-ms", type=int, default=0, help="Sleep between songs (avoid overheating).")
+    ap.add_argument("--timeout-s", type=int, default=180)
 
-    ap.add_argument("--websearch", action="store_true", help="Enable web search snippets for the LLM")
-    ap.add_argument("--web-k", type=int, default=3)
-    ap.add_argument("--web-timeout", type=int, default=20)
-    ap.add_argument("--web-sleep-ms", type=int, default=250)
+    ap.add_argument("--only-missing", action="store_true", help="Only classify if mood_llm/genre_llm/rhythm_llm missing or unknown.")
+    ap.add_argument("--force", action="store_true", help="Force re-classify even if fields exist.")
+    ap.add_argument("--write-canonical", action="store_true", help="Also write canonical fields mood/genre/rhythm (optional).")
+    ap.add_argument("--dry-run", action="store_true")
 
-    ap.add_argument("--ollama-timeout", type=int, default=180)
+    ap.add_argument("--fix-bad-youtube", action="store_true", help="Mark bad youtube_url (search-results URLs) for re-fix later.")
 
-    ap.add_argument("--checkpoint", default=".checkpoint_meta.jsonl")
-    ap.add_argument("--print-raw", action="store_true")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--debug-every", type=int, default=50)
+    ap.add_argument("--print-raw", action="store_true")
+
+    ap.add_argument("--checkpoint", default=".checkpoint_meta.jsonl")
 
     args = ap.parse_args()
 
-    qdrant = QdrantClient(url=args.qdrant_url)
+    if args.force and args.only_missing:
+        print("NOTE: --force overrides --only-missing")
+        args.only_missing = False
 
-    # load checkpointed song_ids
-    done = set()
-    if os.path.exists(args.checkpoint):
-        with open(args.checkpoint, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    sid = rec.get("song_id")
-                    if sid:
-                        done.add(sid)
-                except Exception:
-                    continue
+    done = load_checkpoint(args.checkpoint)
+    client = QdrantClient(url=args.qdrant_url)
 
-    limit = args.max_songs if args.max_songs and args.max_songs > 0 else None
+    songs = get_unique_songs(client, args.collection, page_size=args.page_size, limit=args.limit)
+    total = len(songs)
 
-    songs = _scroll_unique_songs(qdrant, args.collection, args.page_size, limit=None)
-    print(f"Unique songs found: {len(songs)} (checkpointed: {len(done)})")
+    print(f"Loaded checkpointed songs: {len(done)}")
+    print(f"Unique songs found: {total} (checkpointed: {len(done)})")
 
-    updated_meta_songs = 0
+    updated_meta = 0
     skipped = 0
     failed = 0
+    youtube_fixed = 0
 
-    to_process = songs
-    if limit:
-        to_process = songs[:limit]
+    t0 = time.time()
+    processed = 0
 
-    for idx, s in enumerate(to_process, start=1):
+    for idx, s in enumerate(songs, 1):
         sid = s["song_id"]
         if sid in done:
             skipped += 1
             continue
 
-        # fetch any existing llm fields from ANY chunk (we’ll read from first available chunk via scroll filter)
-        # pick one point payload
-        filt = rest.Filter(must=[rest.FieldCondition(key="song_id", match=rest.MatchValue(value=sid))])
-        pts, _ = qdrant.scroll(
-            collection_name=args.collection,
-            scroll_filter=filt,
-            with_payload=True,
-            with_vectors=False,
-            limit=1,
-        )
-        payload0 = (pts[0].payload or {}) if pts else {}
-        mood_llm_existing = payload0.get("mood_llm")
-        genre_llm_existing = payload0.get("genre_llm")
-        rhythm_llm_existing = payload0.get("rhythm_llm")
+        payload_sample = s.get("payload_sample") or {}
+        title = safe_str(s.get("title"))
+        movie = safe_str(s.get("movie"))
+        year = safe_str(s.get("year"))
+        song_url = safe_str(s.get("song_url"))
+        lyrics_excerpt = clamp_text(safe_str(s.get("chunk_text")), 600)
 
-        if args.only_missing:
-            if (not _is_missing(mood_llm_existing)) and (not _is_missing(genre_llm_existing)) and (not _is_missing(rhythm_llm_existing)):
-                skipped += 1
-                with open(args.checkpoint, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"song_id": sid, "status": "skipped_already_filled", "ts": _now_iso()}) + "\n")
-                continue
-
-        title = s.get("title") or payload0.get("title") or ""
-        movie = s.get("movie") or payload0.get("movie")
-        year = s.get("year") or payload0.get("year")
-        year = str(year) if year is not None else None
-
-        lyrics_excerpt = s.get("lyrics_excerpt") or _strip_noise(str(payload0.get("chunk_text") or payload0.get("lyrics_text") or ""))[:500]
-
-        if not lyrics_excerpt or len(lyrics_excerpt.strip()) < 40:
+        # If no lyrics text in Qdrant payload, skip
+        if not lyrics_excerpt.strip():
+            append_checkpoint(args.checkpoint, {"song_id": sid, "status": "skipped_no_lyrics", "ts": now_iso()})
             skipped += 1
-            with open(args.checkpoint, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"song_id": sid, "status": "skipped_no_lyrics", "ts": _now_iso()}) + "\n")
             continue
 
-        if args.debug and (idx % max(1, args.debug_every) == 0 or args.debug_every == 1):
-            print("\n" + "-" * 60)
-            print(f"Song ID: {sid}")
-            print(f"Title: {title} | Movie: {movie} | Year: {year}")
-            print(f"Lyrics excerpt: {lyrics_excerpt[:220]}")
-            print()
+        # only-missing logic
+        if args.only_missing and (not is_missing(payload_sample)):
+            append_checkpoint(args.checkpoint, {"song_id": sid, "status": "skipped_has_meta", "ts": now_iso()})
+            skipped += 1
+            continue
 
-        web_snips: List[str] = []
-        if args.websearch:
-            q = f'{title} {movie or ""} {year or ""} Tamil song mood genre'
-            web_snips = _ddg_search_snippets(q, k=args.web_k, timeout_s=args.web_timeout, sleep_ms=args.web_sleep_ms)
+        # optional: mark bad youtube_url
+        if args.fix_bad_youtube and is_bad_youtube_url(payload_sample):
+            if not args.dry_run:
+                try:
+                    upsert_payload_all_chunks(
+                        client,
+                        args.collection,
+                        sid,
+                        {
+                            "youtube_url": None,
+                            "youtube_status": "needs_refetch",
+                            "youtube_updated_at": now_iso(),
+                        },
+                        page_size=args.page_size,
+                    )
+                    youtube_fixed += 1
+                except Exception as e:
+                    # Don't fail the entire meta classify for this
+                    if args.debug:
+                        print(f"[WARN] youtube fix failed for {sid}: {e}")
+
+        # Web search query: title + movie + year
+        query = " ".join([x for x in [title.replace("Song Lyrics", "").strip(), movie, year, "Tamil song"] if x]).strip()
+        web_snips = ddg_search(query, top_k=3, timeout_s=15)
+
+        if args.debug and (idx % max(1, args.debug_every) == 0):
+            print("\n" + "-" * 60)
+            print(f"[{idx}/{total}] Song ID: {sid}")
+            print(f"Title: {title} | Movie: {movie} | Year: {year}")
+            print(f"Lyrics excerpt: {lyrics_excerpt[:180]}...")
+
+        prompt = build_prompt(title=title, movie=movie, year=year, lyrics_excerpt=lyrics_excerpt, web_snips=web_snips)
 
         try:
-            parsed, raw = _ollama_classify(
+            raw, parsed = ollama_chat(
                 ollama_url=args.ollama_url,
                 model=args.model,
-                title=title,
-                movie=movie,
-                year=year,
-                lyrics_excerpt=lyrics_excerpt,
-                web_snippets=web_snips,
-                timeout_s=args.ollama_timeout,
-                debug=args.debug,
+                prompt=prompt,
+                timeout_s=args.timeout_s,
             )
 
             if args.print_raw:
-                print("=" * 80)
+                print("\n" + "=" * 80)
                 print("[LLM RAW OUTPUT]")
-                print(raw.strip())
-                print("=" * 80)
+                print(raw)
+                print("=" * 80 + "\n")
 
-            if not parsed:
+            meta = normalize_meta(parsed or {})
+            if not meta:
+                append_checkpoint(args.checkpoint, {"song_id": sid, "status": "failed_parse", "ts": now_iso(), "raw": clamp_text(raw, 500)})
                 failed += 1
-                with open(args.checkpoint, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"song_id": sid, "status": "llm_failed", "ts": _now_iso()}) + "\n")
                 continue
 
-            mood = _canonicalize(parsed.get("mood"), MOODS)
-            genre = _canonicalize(parsed.get("genre"), GENRES)
-            rhythm = _canonicalize(parsed.get("rhythm"), RHYTHMS)
-            confidence = parsed.get("confidence")
-            try:
-                confidence = float(confidence)
-            except Exception:
-                confidence = 0.3
-            confidence = max(0.0, min(1.0, confidence))
-
-            why = parsed.get("why")
-            if why is not None:
-                why = str(why)[:280]
-
-            payload_updates: Dict[str, Any] = {
-                "mood_llm": mood,
-                "genre_llm": genre,
-                "rhythm_llm": rhythm,
-                "meta_source": f"ollama:{args.model}" + (":web" if args.websearch else ""),
-                "meta_confidence": confidence,
-                "meta_updated_at": _now_iso(),
+            payload_updates = {
+                "mood_llm": meta["mood"],
+                "genre_llm": meta["genre"],
+                "rhythm_llm": meta["rhythm"],
+                "meta_confidence": meta["confidence"],
+                "meta_source": f"ollama:{args.model}+ddg",
+                "meta_updated_at": now_iso(),
+                "meta_why": meta["why"],
             }
-            if why:
-                payload_updates["meta_why"] = why
 
+            # Optional: overwrite canonical fields too (if you want the UI to read mood directly)
             if args.write_canonical:
-                # Only overwrite canonical if missing/unknown currently
-                if _is_missing(payload0.get("mood")):
-                    payload_updates["mood"] = mood
-                if _is_missing(payload0.get("genre")):
-                    payload_updates["genre"] = genre
-                if _is_missing(payload0.get("rhythm")):
-                    payload_updates["rhythm"] = rhythm
+                payload_updates.update({
+                    "mood": meta["mood"],
+                    "genre": meta["genre"],
+                    "rhythm": meta["rhythm"],
+                })
 
-            # update all chunks for that song
-            _set_payload_for_song(qdrant, args.collection, sid, payload_updates)
+            if not args.dry_run:
+                pts_updated = upsert_payload_all_chunks(
+                    client,
+                    args.collection,
+                    sid,
+                    payload_updates,
+                    page_size=args.page_size,
+                )
 
-            updated_meta_songs += 1
-            with open(args.checkpoint, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"song_id": sid, "status": "updated", **payload_updates}) + "\n")
+            updated_meta += 1
+            append_checkpoint(args.checkpoint, {"song_id": sid, "status": "updated", "ts": now_iso(), **payload_updates})
 
-        except Exception as e:
+        except requests.exceptions.Timeout:
+            append_checkpoint(args.checkpoint, {"song_id": sid, "status": "failed_timeout", "ts": now_iso()})
             failed += 1
-            with open(args.checkpoint, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"song_id": sid, "status": "llm_failed", "error": str(e)[:300], "ts": _now_iso()}) + "\n")
+        except Exception as e:
+            append_checkpoint(args.checkpoint, {"song_id": sid, "status": "failed_exception", "ts": now_iso(), "err": safe_str(e)})
+            failed += 1
 
-        if args.debug and (idx % max(1, args.debug_every) == 0 or args.debug_every == 1):
-            print(f"[{idx}/{len(to_process)}] updated_meta_songs={updated_meta_songs} skipped={skipped} failed={failed}")
+        processed += 1
+        # Progress log every song (simple + clear)
+        elapsed = time.time() - t0
+        rate = processed / elapsed if elapsed > 0 else 0.0
+        eta = (total - idx) / rate if rate > 0 else 0.0
+        print(f"[{idx}/{total}] updated_meta={updated_meta} skipped={skipped} failed={failed} youtube_fixed={youtube_fixed} | {rate:.2f}/s ETA~{eta/60:.1f}m")
+
+        if args.sleep_ms > 0:
+            time.sleep(args.sleep_ms / 1000.0)
+
+        if args.max_songs and processed >= args.max_songs:
+            break
 
     print("\nDone.")
-    print(f"Updated meta songs: {updated_meta_songs}")
+    print(f"Updated meta songs: {updated_meta}")
     print(f"Skipped: {skipped}")
     print(f"Failed: {failed}")
+    print(f"YouTube fixed: {youtube_fixed}")
+    print(f"Elapsed: {time.time() - t0:.1f}s")
     print(f"Checkpoint: {args.checkpoint}")
 
 
